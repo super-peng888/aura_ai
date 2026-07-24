@@ -1,0 +1,225 @@
+version: "3.9"
+
+services:
+  # ==========================================================================
+  # PostgreSQL
+  # ==========================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: aura-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PG_USER:-aura}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-aura123}
+      POSTGRES_DB: ${PG_DATABASE:-aura_ai}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/01-init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-aura} -d ${PG_DATABASE:-aura_ai}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - aura-network
+
+  # ==========================================================================
+  # Milvus (Standalone)
+  # ==========================================================================
+  etcd:
+    container_name: aura-milvus-etcd
+    image: quay.io/coreos/etcd:v3.5.5
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - etcd_data:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - aura-network
+
+  minio:
+    container_name: aura-milvus-minio
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    ports:
+      - "9001:9001"
+      - "9002:9000"
+    volumes:
+      - minio_data:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9002/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - aura-network
+
+  milvus-standalone:
+    container_name: aura-milvus
+    image: milvusdb/milvus:v2.4.0
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    volumes:
+      - milvus_data:/var/lib/milvus
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    depends_on:
+      - etcd
+      - minio
+    networks:
+      - aura-network
+
+  # ==========================================================================
+  # MinIO (Application OSS)
+  # ==========================================================================
+  oss:
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    container_name: aura-oss
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${OSS_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${OSS_SECRET_KEY:-minioadmin}
+    volumes:
+      - oss_data:/data
+    ports:
+      - "9000:9000"
+      - "9003:9003"
+    command: server /data --console-address ":9003"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - aura-network
+
+  # ==========================================================================
+  # Python Service
+  # ==========================================================================
+#  python-service:
+#    build:
+#      context: ./python-service
+#      dockerfile: Dockerfile
+#    container_name: aura-python-service
+#    restart: unless-stopped
+#    environment:
+#      - PG_HOST=postgres
+#      - PG_PORT=5432
+#      - PG_USER=${PG_USER:-aura}
+#      - PG_PASSWORD=${PG_PASSWORD:-aura123}
+#      - PG_DATABASE=${PG_DATABASE:-aura_ai}
+#      - MILVUS_HOST=milvus-standalone
+#      - MILVUS_PORT=19530
+#      - OPENAI_API_KEY=${OPENAI_API_KEY}
+#      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com/v1}
+#      - OSS_ENDPOINT=http://oss:9000
+#      - OSS_ACCESS_KEY=${OSS_ACCESS_KEY:-minioadmin}
+#      - OSS_SECRET_KEY=${OSS_SECRET_KEY:-minioadmin}
+#      - OSS_BUCKET=${OSS_BUCKET:-aura-ai}
+#      - COHERE_API_KEY=${COHERE_API_KEY}
+#    ports:
+#      - "8000:8000"
+#    depends_on:
+#      postgres:
+#        condition: service_healthy
+#      milvus-standalone:
+#        condition: service_started
+#      oss:
+#        condition: service_started
+#    volumes:
+#      - ./python-service:/app
+#    networks:
+#      - aura-network
+
+  # ==========================================================================
+  # Index Worker
+  # ==========================================================================
+  index-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aura-index-worker
+    restart: unless-stopped
+    command: ["python", "-m", "app.workers.index_worker"]
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - PG_HOST=postgres
+      - PG_PORT=5432
+      - PG_USER=${PG_USER:-aura}
+      - PG_PASSWORD=${PG_PASSWORD:-aura123}
+      - PG_DATABASE=${PG_DATABASE:-aura_ai}
+      - MILVUS_HOST=milvus-standalone
+      - MILVUS_PORT=19530
+      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-${OPENAI_API_KEY}}
+      - EMBEDDING_BASE_URL=${EMBEDDING_BASE_URL:-https://api.openai.com/v1}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-v4}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-3072}
+      - COHERE_API_KEY=${COHERE_API_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - aura-network
+
+  # ==========================================================================
+  # Qdrant (Mem0 长期记忆向量存储)
+  # ==========================================================================
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: aura-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - aura-network
+
+  # ==========================================================================
+  # Redis (Optional - for caching / session)
+  # ==========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: aura-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - aura-network
+
+volumes:
+  postgres_data:
+  etcd_data:
+  minio_data:
+  milvus_data:
+  oss_data:
+  redis_data:
+  qdrant_data:
+
+networks:
+  aura-network:
+    driver: bridge

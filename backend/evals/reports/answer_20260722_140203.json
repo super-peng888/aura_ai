@@ -1,0 +1,93 @@
+{
+  "timestamp": "2026-07-22T14:02:03",
+  "mode": "mock",
+  "golden": "D:\\WorkingDir\\aura-ai-enterprise\\backend\\evals\\golden.jsonl",
+  "k": 5,
+  "summary": {
+    "faithfulness": 4.0,
+    "relevance": 4.5,
+    "count": 10
+  },
+  "items": [
+    {
+      "id": "q001",
+      "query": "公司的年假政策是怎么规定的？",
+      "category": "single-hop",
+      "answer": "根据检索内容：与「公司的年假政策是怎么规定的？」相关的模拟内容片段 0 年假 命中片段（模拟答案）",
+      "faithfulness": 4.0,
+      "relevance": 4.5
+    },
+    {
+      "id": "q002",
+      "query": "报销差旅费需要哪些材料和流程？",
+      "category": "single-hop",
+      "answer": "根据检索内容：与「报销差旅费需要哪些材料和流程？」相关的模拟内容片段 0 报销 命中片段（模拟答案）",
+      "faithfulness": 4.0,
+      "relevance": 4.5
+    },
+    {
+      "id": "q003",
+      "query": "新员工入职需要办理哪些手续？",
+      "category": "single-hop",
+      "answer": "根据检索内容：与「新员工入职需要办理哪些手续？」相关的模拟内容片段 0 入职 命中片段（模拟答案）",
+      "faithfulness": 4.0,
+      "relevance": 4.5
+    },
+    {
+      "id": "q004",
+      "query": "出差住宿标准和交通标准分别是多少？",
+      "category": "multi-hop",
+      "answer": "根据检索内容：与「出差住宿标准和交通标准分别是多少？」相关的模拟内容片段 0 住宿 命中片段（模拟答案）",
+      "faithfulness": 4.0,
+      "relevance": 4.5
+    },
+    {
+      "id": "q005",
+      "query": "绩效考核的周期和评级方式是什么？",
+      "category": "single-hop",
+      "answer": "根据检索内容：与「绩效考核的周期和评级方式是什么？」相关的模拟内容片段 0 绩效 命中片段（模拟答案）",
+      "faithfulness": 4.0,
+      "relevance": 4.5
+    },
+    {
+      "id": "q006",
+      "query": "试用期多久，转正流程是什么？",
+      "category": "multi-hop",
+      "answer": "根据检索内容：与「试用期多久，转正流程是什么？」相关的模拟内容片段 0 试用期 命中片段（模拟答案）",
+      "faithfulness": 4.0,
+      "relevance": 4.5
+    },
+    {
+      "id": "q007",
+      "query": "公司的数据安全和保密制度有哪些要求？",
+      "category": "global",
+      "answer": "根据检索内容：与「公司的数据安全和保密制度有哪些要求？」相关的模拟内容片段 0 保密 命中片段（模拟答案）",
+      "faithfulness": 4.0,
+      "relevance": 4.5
+    },
+    {
+      "id": "q008",
+      "query": "远程办公的申请条件和审批流程？",
+      "category": "single-hop",
+      "answer": "根据检索内容：与「远程办公的申请条件和审批流程？」相关的模拟内容片段 0 远程办公 命中片段（模拟答案）",
+      "faithfulness": 4.0,
+      "relevance": 4.5
+    },
+    {
+      "id": "q009",
+      "query": "员工培训和晋升通道是怎么设计的？",
+      "category": "multi-hop",
+      "answer": "根据检索内容：与「员工培训和晋升通道是怎么设计的？」相关的模拟内容片段 0 培训 命中片段（模拟答案）",
+      "faithfulness": 4.0,
+      "relevance": 4.5
+    },
+    {
+      "id": "q010",
+      "query": "离职手续和社保公积金如何处理？",
+      "category": "global",
+      "answer": "根据检索内容：与「离职手续和社保公积金如何处理？」相关的模拟内容片段 0 离职 命中片段（模拟答案）",
+      "faithfulness": 4.0,
+      "relevance": 4.5
+    }
+  ]
+}
