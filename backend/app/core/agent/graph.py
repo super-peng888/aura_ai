@@ -8,7 +8,6 @@ from app.core.agent.nodes import (
     generate_response_node,
     intent_router,
     load_memory_node,
-    retrieve_context_node,
     route_after_reason,
     save_memory_node,
     tool_exec_node,
@@ -21,7 +20,6 @@ def build_agent_graph() -> StateGraph:
 
     workflow.add_node("load_memory", load_memory_node)
     workflow.add_node("classify", classify_intent_node)
-    workflow.add_node("retrieve", retrieve_context_node)
     workflow.add_node("agent_reason", agent_reason_node)
     workflow.add_node("tool_exec", tool_exec_node)
     workflow.add_node("generate", generate_response_node)
@@ -33,13 +31,11 @@ def build_agent_graph() -> StateGraph:
         "classify",
         intent_router,
         {
-            "retrieve": "retrieve",
             "agent_reason": "agent_reason",
             "generate": "generate",
             "data_analysis": "generate",
         },
     )
-    workflow.add_edge("retrieve", "generate")
     workflow.add_conditional_edges(
         "agent_reason",
         route_after_reason,

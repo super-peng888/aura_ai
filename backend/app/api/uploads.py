@@ -10,6 +10,7 @@ from app.db.models import User, Document
 from app.db.base import AsyncSessionLocal
 from app.db.repository import document_repo, user_repo
 from app.services.storage_service import storage_service
+from app.services.document_parse_service import resolve_temp_suffix
 from app.api.auth import get_current_user
 
 router = APIRouter(prefix="/uploads", tags=["Uploads"])
@@ -20,7 +21,9 @@ async def get_presigned_url(
     request: PresignUploadRequest,
     current_user: User = Depends(get_current_user),
 ):
-    ext = mimetypes.guess_extension(request.content_type) or ""
+    # 优先取原始文件名扩展名，兜底按 mime 推断（Office 类走显式映射，
+    # 避免 Windows 注册表把 docx 的 mime 猜成 .doc）
+    ext = resolve_temp_suffix(request.filename, mime_type=request.content_type)
     unique_name = f"{uuid.uuid4().hex}{ext}"
     presigned_url = await storage_service.get_presigned_upload_url(unique_name, request.content_type)
     public_url = storage_service.get_url(unique_name)
@@ -49,7 +52,10 @@ async def upload_document(
     auto_parse=True 时解析通过 BackgroundTasks 真后台执行，不阻塞上传响应。
     """
     content = await file.read()
-    ext = mimetypes.guess_extension(file.content_type or "application/octet-stream") or ""
+    # 优先取用户原始文件名的扩展名（最可靠），兜底按 content_type 推断；
+    # resolve_temp_suffix 内置 Office mime 显式映射，规避 Windows 注册表
+    # 把 docx 猜成 .doc / 猜不出扩展名导致后续解析无法识别文档类型。
+    ext = resolve_temp_suffix(file.filename or "", mime_type=file.content_type or "application/octet-stream")
     filename = f"{uuid.uuid4().hex}{ext}"
 
     object_key = await storage_service.upload_file(

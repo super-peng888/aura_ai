@@ -59,12 +59,10 @@ class RAGPipeline:
             rewritten_query = await llm_service.rewrite_query(query)
 
         query_embedding = await embedding_service.embed_query(rewritten_query)
-        query_sparse = await embedding_service.embed_query_sparse(rewritten_query)
 
         retrieved = await retrieval_service.retrieve(
             query=rewritten_query,
             query_embedding=query_embedding,
-            query_sparse=query_sparse,
             document_ids=document_ids,
             knowledge_base_ids=knowledge_base_ids,
             top_k=top_k * 2,
@@ -89,19 +87,47 @@ class RAGPipeline:
 
         similarity_threshold = cfg["similarity_threshold"]
         if similarity_threshold and similarity_threshold > 0:
+            # 阈值只对 rerank 重打分（relevance_score，0~1 量纲）的结果生效：
+            # - graph/graph_global：图结果分数不可比，豁免（既有语义）
+            # - 未经 rerank（关闭/降级）：score 是 Milvus RRF 融合分（量级 ~1/60），
+            #   与 0~1 阈值量纲不可比，一旦过滤会把全部结果误杀成空上下文，
+            #   导致 LLM 无资料纯自由发挥（检索失效的隐蔽根因）
             retrieved = [
                 c for c in retrieved
-                if c.get("score", 0) >= similarity_threshold
-                or c.get("search_type") in ("graph", "graph_global")  # 图结果分数不可比，不做阈值过滤
+                if not c.get("reranked")
+                or c.get("score", 0) >= similarity_threshold
+                or c.get("search_type") in ("graph", "graph_global")
             ]
 
-        results_with_images = await self._resolve_images(retrieved)
+        results_with_images = await self._resolve_images(self._expand_to_parents(retrieved))
 
         return {
             "query": query,
             "rewritten_query": rewritten_query if enable_query_rewrite else None,
             "results": results_with_images,
         }
+
+    @staticmethod
+    def _expand_to_parents(chunks: List[dict]) -> List[dict]:
+        """父子分块（small-to-big）：命中子块后回捞父节完整内容送 LLM。
+
+        - 入参已按分数降序（rerank/RRF 后），同一父节的多个子块只保留
+          排位最高的一个，并将 content 换为父节完整内容；
+        - 无 parent_id 的结果（非 markdown / 单子块节 / 图检索）按 chunk_id 去重，原样保留；
+        - rerank 基于精确子块打分，回捞发生在排序之后，不影响相关性判断。
+        """
+        seen: set = set()
+        out: List[dict] = []
+        for c in chunks:
+            pid = c.get("parent_id")
+            key = pid or c.get("chunk_id")
+            if key in seen:
+                continue
+            seen.add(key)
+            if pid and c.get("parent_content"):
+                c = {**c, "content": c["parent_content"]}
+            out.append(c)
+        return out
 
     @staticmethod
     async def _graph_search(query: str, top_k: int, cfg: dict) -> List[dict]:

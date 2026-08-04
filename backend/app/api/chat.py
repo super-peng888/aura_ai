@@ -14,7 +14,7 @@ from sse_starlette.sse import EventSourceResponse
 from app.models.schemas import ChatRequest, BaseResponse, ChatResponse
 from app.core.agent import agent_service
 from app.db.base import AsyncSessionLocal
-from app.db.repository import message_repo
+from app.db.repository import conversation_repo, message_repo
 from app.db.models import User, Message
 from app.api.auth import get_current_user, require_permission
 router = APIRouter(prefix="/chat", tags=["Chat"])
@@ -60,6 +60,19 @@ async def _chat_generator(request: ChatRequest, current_user: User) -> AsyncIter
 
     user_msg = request.messages[-1].content if request.messages else ""
     messages.append({"role": "user", "content": user_msg})
+
+    # 先持久化用户消息，保证 created_at 顺序：历史 < user < assistant（修历史只剩 AI 消息）
+    if request.conversation_id and user_msg:
+        try:
+            async with AsyncSessionLocal() as session:
+                await message_repo.create(session, Message(
+                    conversation_id=request.conversation_id,
+                    role="user",
+                    content=user_msg,
+                ))
+                await session.commit()
+        except Exception as e:
+            print(f"[chat] Failed to save user message: {e}")
 
     full_response = ""
     citations = []
@@ -145,6 +158,7 @@ async def chat_stream(request: ChatRequest, current_user: User = Depends(require
 
     支持的事件类型：
     - text: 普通文本片段（rag/direct）
+    - thought: 思维链步骤 {kind, step, title, content, status}（agentic 实时推送，不落库）
     - citations: 引用来源列表
     - images: 关联图片列表
     - content_blocks: 图文内容块

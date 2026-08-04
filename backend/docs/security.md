@@ -182,7 +182,6 @@ JWT_EXPIRATION_HOURS=24
 # ============================================
 MILVUS_HOST=localhost
 MILVUS_PORT=19530
-MILVUS_ENABLE_HYBRID=true
 ```
 
 ---

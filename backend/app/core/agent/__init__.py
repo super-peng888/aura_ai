@@ -12,9 +12,8 @@
 
 设计要点：
 - AgentState 携带 llm_config 字段，在节点间传递用户模型配置（用户自己的 API Key）
-- rag_mode="pipeline"（默认）：rag 意图走固定 retrieve → generate 管道
-- rag_mode="agentic"（检索配置）：rag 意图走 agent_reason → tool_exec 工具调用循环，
-  LLM 自主决定调用 knowledge_search 工具（上限 MAX_TOOL_CALLS 次），SSE 事件序列与 pipeline 模式一致
+- rag 意图恒走 agent_reason → tool_exec 工具调用循环（agentic），
+  LLM 自主决定调用 knowledge_search 工具（上限 MAX_TOOL_CALLS 次），并通过 thought 事件推送思维链
 """
 
 from app.core.agent.state import AgentState
@@ -30,7 +29,6 @@ from app.core.agent.nodes import (
     generate_response_node,
     intent_router,
     load_memory_node,
-    retrieve_context_node,
     route_after_reason,
     save_memory_node,
     tool_exec_node,
@@ -46,7 +44,6 @@ __all__ = [
     "_resolve_chat_model",
     "load_memory_node",
     "classify_intent_node",
-    "retrieve_context_node",
     "agent_reason_node",
     "tool_exec_node",
     "generate_response_node",

@@ -30,6 +30,7 @@ dependencies = [
     "langchain-openai>=1.2.0,<2.0.0",
     "langchain-community>=0.4.0,<0.5.0",
     "langgraph>=1.2.0,<2.0.0",
+    "langchain-mcp-adapters>=0.3.0,<0.4.0",
 
     # RAG & Indexing
     "llama-index>=0.14.0,<0.15.0",
@@ -52,10 +53,8 @@ dependencies = [
     # Image Processing
     "pillow>=10.4.0,<11.0.0",
 
-    # OSS
+    # OSS (RustFS，S3 兼容，使用 minio 客户端)
     "minio>=7.2.0,<8.0.0",
-    "oss2>=2.18.0,<3.0.0",
-    "boto3>=1.35.0,<1.40.0",
 
     # Auth
     "passlib[bcrypt]>=1.7.4,<1.8.0",
@@ -74,6 +73,9 @@ dependencies = [
     # Reranker & Sparse Embedding
     "sentence-transformers>=3.2.0,<4.0.0",
     "transformers>=4.45.0,<5.0.0",
+
+    # Embedding（DashScope 官方 SDK，多模态向量 MultiModalEmbedding）
+    "dashscope>=1.20.0",
 
     # Memory
     "mem0ai>=0.1.0",

@@ -9,6 +9,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import List, Optional
 
+from redis.exceptions import TimeoutError as RedisTimeoutError
+
 from app.config import get_settings
 from app.utils.cache import get_redis
 
@@ -64,18 +66,25 @@ async def read_index_tasks(consumer_name: str, count: int = 1, block_ms: int = 5
     """Read pending/new tasks from the consumer group.
 
     Returns list of tuples (message_id, payload_dict).
+
+    阻塞读（block_ms）到期无新消息时，xreadgroup 可能返回 None，也可能因
+    客户端读超时与阻塞时长撞车而抛 redis TimeoutError。两者均属“本轮无任务”
+    的正常语义，统一返回空列表，避免消费循环误当作致命错误。
     """
     redis = get_redis()
-    raw = await redis.xreadgroup(
-        groupname=settings.INDEX_QUEUE_GROUP,
-        consumername=consumer_name,
-        streams={settings.INDEX_QUEUE_STREAM: ">"},
-        count=count,
-        block=block_ms,
-    )
+    try:
+        raw = await redis.xreadgroup(
+            groupname=settings.INDEX_QUEUE_GROUP,
+            consumername=consumer_name,
+            streams={settings.INDEX_QUEUE_STREAM: ">"},
+            count=count,
+            block=block_ms,
+        )
+    except RedisTimeoutError:
+        return []
 
     tasks = []
-    for stream, entries in raw:
+    for stream, entries in (raw or []):
         for message_id, fields in entries:
             payload_raw = fields.get("payload") or fields.get(b"payload")
             if isinstance(payload_raw, bytes):

@@ -22,7 +22,8 @@ from langchain_core.language_models.chat_models import BaseChatModel
 
 from app.config import get_settings
 from app.db.base import AsyncSessionLocal
-from app.db.repository import user_repo, user_model_config_repo
+from app.db.repository import user_repo
+from app.services.usage_service import usage_service
 from app.utils.cache import cache_get_or_set, cache_delete
 from app.utils.request_context import get_current_user_id
 
@@ -84,18 +85,33 @@ class ChatLLM:
                 api_key=self.api_key,
                 base_url=self.base_url,
                 streaming=True,
+                stream_usage=True,  # 流式响应末尾 chunk 携带 usage（token 用量埋点用）
             )
         return self._model
+
+    def _track_usage(self, usage_metadata: Optional[dict], scene: str) -> None:
+        """LangChain usage_metadata → 用量埋点（无 usage 时仅计调用次数）。"""
+        um = usage_metadata or {}
+        usage_service.track(
+            "llm",
+            self.model,
+            scene=scene,
+            prompt_tokens=int(um.get("input_tokens") or 0),
+            completion_tokens=int(um.get("output_tokens") or 0),
+            total_tokens=int(um.get("total_tokens") or 0),
+        )
 
     async def generate(
         self,
         messages: List[dict],
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
+        scene: str = "generate",
     ) -> str:
         model = self.get_model()
         lc_messages = self._to_lc_messages(messages)
         result = await model.ainvoke(lc_messages, config={"temperature": temperature, "max_tokens": max_tokens})
+        self._track_usage(getattr(result, "usage_metadata", None), scene)
         return result.content or ""
 
     async def generate_stream(
@@ -103,13 +119,18 @@ class ChatLLM:
         messages: List[dict],
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
+        scene: str = "chat",
     ) -> AsyncIterator[str]:
         model = self.get_model()
         lc_messages = self._to_lc_messages(messages)
+        usage_metadata = None
         async for chunk in model.astream(lc_messages, config={"temperature": temperature, "max_tokens": max_tokens}):
+            if getattr(chunk, "usage_metadata", None):
+                usage_metadata = chunk.usage_metadata
             content = chunk.content
             if content:
                 yield content
+        self._track_usage(usage_metadata, scene)
 
     @staticmethod
     def _to_lc_messages(messages: List[dict]) -> List[BaseMessage]:
@@ -138,11 +159,31 @@ class LLMFactory:
     ) -> ChatLLM:
         """
         provider 语义：
+        - "deepseek"：系统默认对话模型；调用方（UserModelConfigService）已解析好
+          完整字段时直接使用，字段缺失时回落 settings.DEEPSEEK_*（旧缓存/直调兼容）
+        - "system"：系统通用模型列表行（调用方已按行 id 解析好字段）；
+          字段不全时回落系统默认 deepseek，不报错
         - "custom"（或显式传了 api_key/base_url/model 之一）：用户自定义 OpenAI 兼容端点，
           api_key / base_url / model 必须带齐，缺任一项抛 ValueError（不再回落 env 默认）
-        - 其他任何值（deepseek / qwen / glm / None / 历史脏数据）：一律回落系统默认 deepseek
+        - 其他任何值（qwen / glm / None / 历史脏数据）：一律回落系统默认 deepseek
         """
         provider = (provider or "").lower()
+
+        if provider == "deepseek":
+            return ChatLLM(
+                api_key=api_key or settings.DEEPSEEK_API_KEY,
+                base_url=base_url or settings.DEEPSEEK_BASE_URL,
+                model=model or settings.DEEPSEEK_CHAT_MODEL,
+            )
+
+        if provider == "system":
+            if api_key and base_url and model:
+                return ChatLLM(api_key=api_key, base_url=base_url, model=model)
+            return ChatLLM(
+                api_key=settings.DEEPSEEK_API_KEY,
+                base_url=settings.DEEPSEEK_BASE_URL,
+                model=settings.DEEPSEEK_CHAT_MODEL,
+            )
 
         if provider == "custom" or api_key or base_url or model:
             if not (api_key and base_url and model):
@@ -183,8 +224,10 @@ class UserModelConfigService:
     逻辑：
     1. 查 Redis 缓存
     2. 缓存未命中 → 查数据库
-       - 系统默认模型（deepseek）：返回 {"provider": "deepseek"}（历史 qwen/glm 数据一并回落）
-       - 自定义模型（custom）：查 user_model_configs 表，解密 api_key
+       - default_model_id 存 provider_models.id：系统模型 → provider "system"，
+         本人私有模型 → provider "custom"（携带对话参数）
+       - 其余（NULL / 历史脏值 / 绑定已失效）：跟随系统默认对话模型；
+         系统无 text 模型时回落 {"provider": "deepseek"}
     3. 写入 Redis（TTL 300s）
     4. 配置更新时调用 invalidate_cache 清除缓存
     """
@@ -212,26 +255,45 @@ class UserModelConfigService:
                 user = await user_repo.get(session, user_id)
                 if not user:
                     return {}
+                bound = user.default_model_id
 
-                provider = (user.default_model_id or "deepseek").lower()
+            from app.services.system_model_service import SystemModelService  # 懒导入避免循环依赖
 
-                # 自定义模型：查 user_model_configs 中 is_current=True 的配置
-                if provider == "custom":
-                    custom = await user_model_config_repo.get_current_by_user(session, user_id)
-                    if custom:
+            # 绑定具体模型（provider_models.id）：系统模型 → system 分支，
+            # 本人私有模型 → custom 分支携带对话参数；失效/越权 → 穿透系统默认对话模型
+            if bound and len(bound) == 36:
+                cfg = await SystemModelService.resolve_model_by_id(bound, user_id)
+                if cfg:
+                    if cfg["is_system"]:
                         return {
-                            "provider": "custom",
-                            "model": custom.model,
-                            "api_key": decrypt_api_key(custom.api_key or ""),
-                            "base_url": custom.base_url,
-                            "max_tokens": custom.max_tokens,
-                            "temperature": custom.temperature,
-                            "top_p": custom.top_p,
-                            "timeout": custom.timeout,
+                            "provider": "system",
+                            "model": cfg["model"],
+                            "api_key": cfg["api_key"],
+                            "base_url": cfg["base_url"],
                         }
+                    return {
+                        "provider": "custom",
+                        "model": cfg["model"],
+                        "api_key": cfg["api_key"],
+                        "base_url": cfg["base_url"],
+                        "max_tokens": cfg["max_tokens"],
+                        "temperature": cfg["temperature"],
+                        "top_p": cfg["top_p"],
+                        "timeout": cfg["timeout"],
+                    }
 
-                # 系统默认（deepseek）：历史 qwen/glm 等脏数据一律回落默认，不报错
-                return {"provider": "deepseek"}
+            # 未绑定 / 'deepseek'·'custom' 等历史脏值 / 绑定已失效 → 跟随系统默认
+            # 对话模型：resolve("chat") 回落链为系统最早 text 模型 → 系统 multi_modal 模型；
+            # 两者都无则回落 deepseek（字段由 LLMFactory 回落 settings.DEEPSEEK_*）
+            chat_cfg = await SystemModelService.resolve("chat")
+            if chat_cfg.get("assigned"):
+                return {
+                    "provider": "system",
+                    "model": chat_cfg["model"],
+                    "api_key": chat_cfg["api_key"],
+                    "base_url": chat_cfg["base_url"],
+                }
+            return {"provider": "deepseek"}
 
         try:
             return await cache_get_or_set(
@@ -296,10 +358,11 @@ class LLMService:
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         user_config: Optional[dict] = None,
+        scene: str = "generate",
     ) -> str:
         config = await self._resolve_config(user_config)
         llm = self.get_llm(config)
-        return await llm.generate(messages, temperature, max_tokens)
+        return await llm.generate(messages, temperature, max_tokens, scene=scene)
 
     async def generate_stream(
         self,
@@ -307,10 +370,11 @@ class LLMService:
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         user_config: Optional[dict] = None,
+        scene: str = "chat",
     ) -> AsyncIterator[str]:
         config = await self._resolve_config(user_config)
         llm = self.get_llm(config)
-        async for delta in llm.generate_stream(messages, temperature, max_tokens):
+        async for delta in llm.generate_stream(messages, temperature, max_tokens, scene=scene):
             yield delta
 
     # -------------------------------------------------------------------------
@@ -325,10 +389,12 @@ class LLMService:
         system_prompt = (
             "You are a query optimization assistant for a technical document retrieval system.\n\n"
             "Your task is to rewrite the user's query to improve search results. You should:\n"
-            "1. Expand abbreviations and acronyms\n"
-            "2. Add relevant synonyms and related terms\n"
-            "3. Make the query more specific and complete\n"
-            "4. Keep the original intent\n"
+            "1. Keep the rewritten query in the SAME LANGUAGE as the original query "
+            "(never translate, e.g. a Chinese query must stay Chinese)\n"
+            "2. Preserve domain-specific terms, codes, standard names and acronyms VERBATIM "
+            "(e.g. UN/EDIFACT, UNH, ISO 9001) — do not expand or replace them\n"
+            "3. Add a few relevant synonyms or related terms when helpful\n"
+            "4. Keep the original intent; keep the query concise (no longer than ~2x the original)\n"
             "5. Output ONLY the rewritten query, no explanation"
         )
         messages = [
@@ -337,7 +403,7 @@ class LLMService:
         ]
         config = await self._resolve_config(user_config)
         llm = self.get_llm(config)
-        rewritten = await llm.generate(messages, temperature=0.3, max_tokens=200)
+        rewritten = await llm.generate(messages, temperature=0.3, max_tokens=200, scene="rewrite")
         return rewritten.strip() or query
 
     # -------------------------------------------------------------------------
@@ -363,9 +429,12 @@ class LLMService:
 Instructions:
 1. Base your answer primarily on the provided citations
 2. When referencing information, cite the source like [1], [2], etc.
-3. If the context includes image placeholders [IMG:xxx], describe what the image shows based on surrounding text
-4. Be concise but thorough
-5. If the answer is not in the provided context, say so clearly
+3. When the user asks for the exact content of a message, code block, configuration or document,
+   reproduce it VERBATIM from the citations — character for character. NEVER invent, rewrite,
+   "complete" or substitute your own version of content that exists in the citations
+4. If the context includes image placeholders [IMG:xxx], describe what the image shows based on surrounding text
+5. Be concise but thorough
+6. If the answer is not in the provided context, say so clearly — do not fabricate an answer from general knowledge
 
 Context:
 {context_str}
@@ -380,7 +449,7 @@ Context:
 
         config = await self._resolve_config(user_config)
         llm = self.get_llm(config)
-        async for delta in llm.generate_stream(messages, temperature=temperature):
+        async for delta in llm.generate_stream(messages, temperature=temperature, scene="chat"):
             yield delta
 
 

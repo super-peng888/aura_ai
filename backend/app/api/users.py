@@ -1,7 +1,6 @@
 """User management API endpoints — 增加用户级 LLM 配置管理。"""
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from typing import Optional
 
 from app.models.schemas import (
     UserUpdateRequest,
@@ -11,14 +10,11 @@ from app.models.schemas import (
     LLMConfig,
     LLMConfigResponse,
     DefaultModelUpdate,
-    UserModelConfigCreate,
-    UserModelConfigUpdate,
-    UserModelConfigResponse,
     UserRoleUpdate,
 )
 from app.db.models import User
 from app.db.base import AsyncSessionLocal
-from app.db.repository import user_repo, user_role_repo, user_model_config_repo
+from app.db.repository import user_repo, user_role_repo
 from app.api.auth import get_current_user, hash_password, verify_password, require_permission
 from app.config import get_settings
 
@@ -162,10 +158,10 @@ async def clear_llm_config(current_user: User = Depends(get_current_user)):
 
 @router.get("/me/default-model", response_model=BaseResponse)
 async def get_default_model(current_user: User = Depends(get_current_user)):
-    """获取当前用户绑定的默认模型。"""
+    """获取当前用户的对话模型绑定：model_id 或 'system'（跟随系统默认对话模型）。"""
     return BaseResponse(
         data={
-            "provider": current_user.default_model_id or settings.LLM_PROVIDER,
+            "provider": current_user.default_model_id or "system",
         }
     )
 
@@ -175,8 +171,19 @@ async def update_default_model(
     request: DefaultModelUpdate,
     current_user: User = Depends(get_current_user),
 ):
-    """设置当前用户的默认模型（绑定到用户）。"""
-    current_user.default_model_id = request.provider
+    """设置当前用户的对话模型：'system'=跟随系统默认对话模型，uuid=provider_models.id
+    （仅系统或本人私有的 text/multi_modal 模型）。"""
+    if request.provider == "system":
+        current_user.default_model_id = None
+    else:
+        from app.services.system_model_service import system_model_service
+
+        cfg = await system_model_service.resolve_model_by_id(
+            request.provider, str(current_user.id)
+        )
+        if cfg is None:
+            raise HTTPException(status_code=400, detail="模型不存在或不可用于对话")
+        current_user.default_model_id = request.provider
     async with AsyncSessionLocal() as session:
         await user_repo.create(session, current_user)
         await session.commit()
@@ -191,154 +198,6 @@ async def update_default_model(
             "message": "Default model updated",
         }
     )
-
-
-# =============================================================================
-# 用户自定义模型配置（支持多模型）
-# =============================================================================
-
-def _mask_key(key: Optional[str]) -> str:
-    """掩码处理 API Key。"""
-    if not key:
-        return "未配置"
-    if len(key) <= 8:
-        return "***"
-    return f"{key[:4]}****{key[-4:]}"
-
-
-def _to_response(cfg) -> dict:
-    return UserModelConfigResponse(
-        id=str(cfg.id),
-        model=cfg.model,
-        base_url=cfg.base_url,
-        max_tokens=cfg.max_tokens,
-        temperature=cfg.temperature,
-        top_p=cfg.top_p,
-        timeout=cfg.timeout,
-        api_key_masked=_mask_key(cfg.api_key),
-        is_current=cfg.is_current,
-    ).model_dump()
-
-
-@router.get("/me/model-config", response_model=BaseResponse)
-async def list_model_configs(current_user: User = Depends(get_current_user)):
-    """获取当前用户的所有自定义模型配置列表。"""
-    async with AsyncSessionLocal() as session:
-        configs = await user_model_config_repo.list_by_user(session, str(current_user.id))
-    return BaseResponse(data=[_to_response(c) for c in configs])
-
-
-@router.post("/me/model-config", response_model=BaseResponse)
-async def create_model_config(
-    request: UserModelConfigCreate,
-    current_user: User = Depends(get_current_user),
-):
-    """新增自定义模型配置。API Key 加密存储。"""
-    from app.services.llm_service import encrypt_api_key, UserModelConfigService
-    from app.db.models import UserModelConfig
-
-    async with AsyncSessionLocal() as session:
-        cfg = UserModelConfig(
-            user_id=str(current_user.id),
-            model=request.model,
-            base_url=request.base_url,
-            max_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            timeout=request.timeout,
-        )
-        if request.api_key.strip():
-            cfg.api_key = encrypt_api_key(request.api_key.strip())
-
-        await user_model_config_repo.create(session, cfg)
-        await session.commit()
-
-    await UserModelConfigService.invalidate_cache(str(current_user.id))
-    return BaseResponse(data=_to_response(cfg))
-
-
-@router.put("/me/model-config/{config_id}", response_model=BaseResponse)
-async def update_model_config(
-    config_id: str,
-    request: UserModelConfigUpdate,
-    current_user: User = Depends(get_current_user),
-):
-    """更新指定自定义模型配置。API Key 加密存储。"""
-    from app.services.llm_service import encrypt_api_key, UserModelConfigService
-
-    async with AsyncSessionLocal() as session:
-        cfg = await user_model_config_repo.get(session, config_id)
-        if not cfg or str(cfg.user_id) != str(current_user.id):
-            raise HTTPException(status_code=404, detail="Model config not found")
-
-        cfg.model = request.model
-        cfg.base_url = request.base_url
-        cfg.max_tokens = request.max_tokens
-        cfg.temperature = request.temperature
-        cfg.top_p = request.top_p
-        cfg.timeout = request.timeout
-        if request.api_key.strip():
-            cfg.api_key = encrypt_api_key(request.api_key.strip())
-
-        await user_model_config_repo.create(session, cfg)
-        await session.commit()
-
-    await UserModelConfigService.invalidate_cache(str(current_user.id))
-    return BaseResponse(data=_to_response(cfg))
-
-
-@router.delete("/me/model-config/{config_id}", response_model=BaseResponse)
-async def delete_model_config(
-    config_id: str,
-    current_user: User = Depends(get_current_user),
-):
-    """删除指定自定义模型配置。如果删除的是当前默认，自动切回系统内置。"""
-    from app.services.llm_service import UserModelConfigService
-
-    async with AsyncSessionLocal() as session:
-        cfg = await user_model_config_repo.get(session, config_id)
-        if not cfg or str(cfg.user_id) != str(current_user.id):
-            raise HTTPException(status_code=404, detail="Model config not found")
-
-        was_current = cfg.is_current
-        await user_model_config_repo.delete(session, cfg)
-
-        if was_current:
-            current_user.default_model_id = "deepseek"
-            await user_repo.create(session, current_user)
-
-        await session.commit()
-
-    await UserModelConfigService.invalidate_cache(str(current_user.id))
-    return BaseResponse(data={"message": "Model config deleted"})
-
-
-@router.post("/me/model-config/{config_id}/set-default", response_model=BaseResponse)
-async def set_default_model_config(
-    config_id: str,
-    current_user: User = Depends(get_current_user),
-):
-    """将指定自定义模型设为当前默认。同时更新 users.default_model_id 为 'custom'。"""
-    from app.services.llm_service import UserModelConfigService
-
-    async with AsyncSessionLocal() as session:
-        cfg = await user_model_config_repo.get(session, config_id)
-        if not cfg or str(cfg.user_id) != str(current_user.id):
-            raise HTTPException(status_code=404, detail="Model config not found")
-
-        # 清除该用户所有自定义模型的 is_current
-        await user_model_config_repo.clear_current_by_user(session, str(current_user.id))
-        # 设置当前为默认
-        cfg.is_current = True
-        await session.flush()
-
-        # 更新用户默认模型为 custom
-        current_user.default_model_id = "custom"
-        await user_repo.create(session, current_user)
-        await session.commit()
-
-    await UserModelConfigService.invalidate_cache(str(current_user.id))
-    return BaseResponse(data=_to_response(cfg))
 
 
 # =============================================================================

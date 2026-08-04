@@ -60,7 +60,7 @@ class AgentService:
             temperature=temperature,
             data_agent_context=None,
             attachments=attachments or [],
-            rag_mode="pipeline",
+            thoughts=[],
             tool_call_count=0,
             tool_messages=[],
         )
@@ -75,6 +75,11 @@ class AgentService:
 
         async for mode, payload in agent_graph.astream(state, stream_mode=["updates", "custom"]):
             if mode == "custom":
+                # 思维链事件（dict）：实时透传给前端 ThoughtChain，不触发 citations 序列
+                if isinstance(payload, dict):
+                    if payload.get("kind") == "thought":
+                        yield {"type": "thought", "data": payload}
+                    continue
                 # 首个文本增量之前，按原 SSE 契约先发 citations / images 事件
                 if not emitted_intro and intent == "rag" and citations:
                     yield {"type": "citations", "data": citations}

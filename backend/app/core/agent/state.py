@@ -25,9 +25,10 @@ class AgentState(TypedDict):
         knowledge_base_ids: 知识库过滤列表
         temperature: 生成温度
         data_agent_context: Data Agent 分析上下文（当 intent=data_analysis 时使用）
-        rag_mode: RAG 模式（pipeline=固定检索管道 / agentic=工具调用循环，默认 pipeline）
+        thoughts: 思维链步骤累积（实时经 stream writer 推送，此处仅作状态占位）
         tool_call_count: agentic 模式已执行的工具调用次数（上限 MAX_TOOL_CALLS）
         tool_messages: agentic 模式工具循环的消息轨迹（AI 工具调用 + ToolMessage）
+        searched_queries: 已检索过的查询（相同 query 去重，防 LLM 重复检索）
     """
 
     messages: Annotated[list, add_messages]
@@ -47,6 +48,7 @@ class AgentState(TypedDict):
     temperature: float
     data_agent_context: Optional[dict]
     attachments: list
-    rag_mode: str
+    thoughts: list
     tool_call_count: int
     tool_messages: list
+    searched_queries: list

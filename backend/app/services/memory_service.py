@@ -2,9 +2,10 @@
 
 配置来源：
 - llm：系统默认 DeepSeek（settings.DEEPSEEK_*，mem0 侧用 openai 兼容写法）
-- embedder：系统级 embedding 配置（settings.MODEL_BASE_URL / EMBEDDING_TEXT_MODEL /
-  EMBEDDING_DIM / DASHSCOPE_API_KEY）
-- vector_store：settings 的 MEM0_VECTOR_STORE_*/QDRANT_*（基础设施，保留 env）
+- embedder：OpenAI 兼容文本 embedding（settings.MODEL_BASE_URL / MEM0_EMBEDDER_MODEL /
+  EMBEDDING_DIM / DASHSCOPE_API_KEY；主链路的 DashScope 原生多模态端点 Mem0 不支持）
+- vector_store：默认复用系统 Milvus（settings.MILVUS_*，对象存储已统一为
+  RustFS）；亦可通过 MEM0_VECTOR_STORE_PROVIDER=qdrant 回退到 Qdrant（QDRANT_*）
 
 embedding 未配置（缺 DASHSCOPE_API_KEY）时 Mem0 初始化失败 = 明确 log 降级
 （记忆能力关闭，不影响主链路）。client 在首次 async 调用（search/add）时懒建，
@@ -41,11 +42,35 @@ class MemoryService:
                 raise RuntimeError("Embedding API Key 未配置（DASHSCOPE_API_KEY），Mem0 依赖 embedding")
 
             embedder_config = {
-                "model": settings().EMBEDDING_TEXT_MODEL,
+                "model": settings().MEM0_EMBEDDER_MODEL,
                 "api_key": settings().DASHSCOPE_API_KEY,
             }
             if settings().MODEL_BASE_URL:
                 embedder_config["openai_base_url"] = settings().MODEL_BASE_URL
+
+            provider = settings().MEM0_VECTOR_STORE_PROVIDER
+            if provider == "milvus":
+                # 复用系统 Milvus（对象存储已统一为 RustFS）；Mem0 自动创建独立 collection
+                vector_store_config = {
+                    "provider": "milvus",
+                    "config": {
+                        "url": f"http://{settings().MILVUS_HOST}:{settings().MILVUS_PORT}",
+                        "token": settings().MILVUS_TOKEN,
+                        "collection_name": settings().MEM0_COLLECTION_NAME,
+                        "embedding_model_dims": settings().EMBEDDING_DIM,
+                        "metric_type": "COSINE",
+                    },
+                }
+            else:  # qdrant（legacy 回退）
+                vector_store_config = {
+                    "provider": provider,
+                    "config": {
+                        "collection_name": settings().MEM0_COLLECTION_NAME,
+                        "host": settings().QDRANT_HOST,
+                        "port": settings().QDRANT_PORT,
+                        "embedding_model_dims": settings().EMBEDDING_DIM,
+                    },
+                }
 
             config = {
                 "llm": {
@@ -61,15 +86,7 @@ class MemoryService:
                     "provider": "openai",
                     "config": embedder_config,
                 },
-                "vector_store": {
-                    "provider": settings().MEM0_VECTOR_STORE_PROVIDER,
-                    "config": {
-                        "collection_name": settings().MEM0_COLLECTION_NAME,
-                        "host": settings().QDRANT_HOST,
-                        "port": settings().QDRANT_PORT,
-                        "embedding_model_dims": settings().EMBEDDING_DIM,
-                    },
-                },
+                "vector_store": vector_store_config,
                 "version": "v1.1",
             }
             self._client = Memory.from_config(config)

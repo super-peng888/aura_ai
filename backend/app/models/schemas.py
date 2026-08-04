@@ -97,42 +97,58 @@ class LLMConfigResponse(BaseModel):
 
 
 class DefaultModelUpdate(BaseModel):
-    provider: str = Field(..., pattern=r"^(deepseek|custom)$")
+    # system=跟随系统默认对话模型 / uuid=provider_models.id（系统或本人私有 text/multi_modal 模型）
+    provider: str = Field(..., pattern=r"^(system|[0-9a-fA-F-]{36})$")
 
 
-class UserModelConfigCreate(BaseModel):
-    """用户自定义模型配置（新增）"""
-    model: str = Field("gpt-4o", max_length=100)
-    api_key: str = Field("", max_length=500)
-    base_url: str = Field("https://api.openai.com/v1", max_length=500)
-    max_tokens: int = Field(4096, ge=1, le=128000)
-    temperature: float = Field(0.7, ge=0, le=2)
-    top_p: float = Field(0.9, ge=0, le=1)
-    timeout: int = Field(60, ge=1, le=300)
+# ============================================================================
+# 供应商 + 模型两级管理（model_providers / provider_models / 角色指派）
+# ============================================================================
+
+class ProviderCreate(BaseModel):
+    """新建供应商（scope=system 仅 admin，mine=用户私有）"""
+    scope: Literal["system", "mine"] = "mine"
+    name: str = Field(..., min_length=1, max_length=100)
+    base_url: str = Field(..., min_length=1, max_length=512)
+    api_key: Optional[str] = Field(None, max_length=500)  # 留空回落环境变量
 
 
-class UserModelConfigUpdate(BaseModel):
-    """用户自定义模型配置（编辑）"""
-    model: str = Field("gpt-4o", max_length=100)
-    api_key: str = Field("", max_length=500)
-    base_url: str = Field("https://api.openai.com/v1", max_length=500)
-    max_tokens: int = Field(4096, ge=1, le=128000)
-    temperature: float = Field(0.7, ge=0, le=2)
-    top_p: float = Field(0.9, ge=0, le=1)
-    timeout: int = Field(60, ge=1, le=300)
+class ProviderUpdate(BaseModel):
+    """编辑供应商（字段不传保持；clear_api_key=True 清空回落环境变量）"""
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    base_url: Optional[str] = Field(None, min_length=1, max_length=512)
+    api_key: Optional[str] = Field(None, max_length=500)
+    clear_api_key: bool = False
 
 
-class UserModelConfigResponse(BaseModel):
-    """返回给前端的用户自定义模型配置（api_key 掩码处理）"""
-    id: str
-    model: str = "gpt-4o"
-    base_url: str = "https://api.openai.com/v1"
-    max_tokens: int = 4096
-    temperature: float = 0.7
-    top_p: float = 0.9
-    timeout: int = 60
-    api_key_masked: str = "未配置"
-    is_current: bool = False
+class ProviderModelCreate(BaseModel):
+    """供应商下新增模型（能力单选；dimension 仅 embedding；对话参数仅私有模型用）"""
+    model: str = Field(..., min_length=1, max_length=100)
+    capability: Literal["text", "multi_modal", "embedding", "rerank"]
+    dimension: Optional[int] = Field(None, ge=128, le=4096)
+    max_tokens: Optional[int] = Field(None, ge=1, le=128000)
+    temperature: Optional[float] = Field(None, ge=0, le=2)
+    top_p: Optional[float] = Field(None, ge=0, le=1)
+    timeout: Optional[int] = Field(None, ge=1, le=300)
+
+
+class ProviderModelUpdate(BaseModel):
+    """编辑模型（字段不传保持）"""
+    model: Optional[str] = Field(None, min_length=1, max_length=100)
+    capability: Optional[Literal["text", "multi_modal", "embedding", "rerank"]] = None
+    dimension: Optional[int] = Field(None, ge=128, le=4096)
+    max_tokens: Optional[int] = Field(None, ge=1, le=128000)
+    temperature: Optional[float] = Field(None, ge=0, le=2)
+    top_p: Optional[float] = Field(None, ge=0, le=1)
+    timeout: Optional[int] = Field(None, ge=1, le=300)
+
+
+class AssignmentsUpdate(BaseModel):
+    """系统角色指派（admin；仅向量/排序两角色；仅更新传入角色；None=清空回落 .env）"""
+    embedding: Optional[str] = Field(None, max_length=36)
+    rerank: Optional[str] = Field(None, max_length=36)
+    # 区分「未传」与「显式置空」：前端需清空时传 null 并在 clear 列表声明
+    clear: list[str] = Field(default_factory=list)  # 需置空的角色名列表
 
 
 # ============================================================================
@@ -147,7 +163,6 @@ class RetrievalConfigUpdate(BaseModel):
     enable_keyword_search: bool = True
     enable_vector_search: bool = True
     enable_rerank: bool = True
-    rag_mode: Literal["pipeline", "agentic"] = "pipeline"
     enable_graph_rag: bool = False
     graph_search_mode: Literal["auto", "local", "global"] = "auto"
 
@@ -167,30 +182,8 @@ class RetrievalConfigResponse(BaseModel):
     enable_keyword_search: bool = True
     enable_vector_search: bool = True
     enable_rerank: bool = True
-    rag_mode: Literal["pipeline", "agentic"] = "pipeline"
     enable_graph_rag: bool = False
     graph_search_mode: Literal["auto", "local", "global"] = "auto"
-
-
-class ParseConfigUpdate(BaseModel):
-    """系统级解析配置（VLM 视觉解析模型）整体 upsert；vlm_api_key 留空表示保持不变。"""
-    vlm_model: str = Field("qwen3-vl-flash", min_length=1, max_length=100)
-    vlm_base_url: str = Field(
-        "https://dashscope.aliyuncs.com/compatible-mode/v1", min_length=1, max_length=512
-    )
-    vlm_api_key: Optional[str] = None
-    vlm_detail_level: Literal["high", "low"] = "high"
-    vlm_max_tokens: int = Field(4096, ge=256, le=32768)
-
-
-class ParseConfigResponse(BaseModel):
-    """返回给前端的系统级解析配置（api_key 仅掩码与配置标记，不明文外发）"""
-    vlm_model: str = "qwen3-vl-flash"
-    vlm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    vlm_api_key_masked: str = ""
-    vlm_api_key_configured: bool = False
-    vlm_detail_level: str = "high"
-    vlm_max_tokens: int = 4096
 
 
 # ============================================================================
@@ -392,6 +385,8 @@ class ParseStrategyCreate(BaseModel):
     dimension: int = Field(1536, ge=128, le=4096)
     split_method: SplitMethod = SplitMethod.SENTENCE
     extract_images: bool = False
+    # vlm 模式的多模态模型引用：None/'system' = 跟随系统 VLM 角色，否则为 provider_models.id（multi_modal）
+    vlm_model_ref: Optional[str] = Field(None, max_length=50)
 
 
 class ParseStrategyUpdate(BaseModel):
@@ -403,6 +398,7 @@ class ParseStrategyUpdate(BaseModel):
     split_method: Optional[SplitMethod] = None
     extract_images: Optional[bool] = None
     is_default: Optional[bool] = None
+    vlm_model_ref: Optional[str] = Field(None, max_length=50)
 
 
 class ParseStrategyResponse(BaseModel):
@@ -416,8 +412,46 @@ class ParseStrategyResponse(BaseModel):
     dimension: int
     split_method: str
     extract_images: bool
+    vlm_model_ref: Optional[str] = None
     created_at: datetime
     updated_at: datetime
+
+
+class MCPServerCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    transport: str = Field("streamable_http", pattern="^(streamable_http|sse)$")
+    url: str = Field(..., min_length=1, max_length=512)
+    headers: Optional[dict] = None
+    enabled: bool = True
+    description: Optional[str] = None
+
+
+class MCPServerUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    transport: Optional[str] = Field(None, pattern="^(streamable_http|sse)$")
+    url: Optional[str] = Field(None, min_length=1, max_length=512)
+    headers: Optional[dict] = None
+    enabled: Optional[bool] = None
+    description: Optional[str] = None
+
+
+class MCPServerResponse(BaseModel):
+    id: str
+    name: str
+    transport: str
+    url: str
+    headers: Optional[dict] = None
+    enabled: bool
+    description: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class MCPServerTestRequest(BaseModel):
+    """连接测试：支持未保存的配置直接测试。"""
+    transport: str = Field("streamable_http", pattern="^(streamable_http|sse)$")
+    url: str = Field(..., min_length=1, max_length=512)
+    headers: Optional[dict] = None
 
 
 class ParseTaskResponse(BaseModel):
@@ -428,15 +462,6 @@ class ParseTaskResponse(BaseModel):
     error_message: Optional[str] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
-
-
-class DocumentChunkResponse(BaseModel):
-    id: str
-    document_id: str
-    content: str
-    page_number: Optional[int] = None
-    chunk_index: int
-    image_ids: list[str] = []
 
 
 class ImageResponse(BaseModel):

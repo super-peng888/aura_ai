@@ -15,9 +15,23 @@ from typing import List, Optional
 import fitz
 
 from app.config import get_settings
+from app.services.usage_service import usage_service
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
+
+
+def _track_vlm_usage(response, model_name: str) -> None:
+    """VLM chat.completions 响应 → 用量埋点。"""
+    u = getattr(response, "usage", None)
+    usage_service.track(
+        "vlm",
+        model_name,
+        scene="parse",
+        prompt_tokens=getattr(u, "prompt_tokens", 0) or 0,
+        completion_tokens=getattr(u, "completion_tokens", 0) or 0,
+        total_tokens=getattr(u, "total_tokens", 0) or 0,
+    )
 
 
 @dataclass
@@ -28,15 +42,17 @@ class ParsedPage:
     tables: List[str] = field(default_factory=list)
     # 标题条目: {"text": str, "level": int, "pos": int（在 page.text 中的字符位置）}
     headings: List[dict] = field(default_factory=list)
+    # 内容格式: plain | markdown（markdown 强制按标题切分，代码围栏原子保留）
+    content_format: str = "plain"
 
 
 @dataclass
 class ParseStrategyConfig:
     """解析策略配置，由调用方（根据用户策略）提供。
 
-    vlm_config 由 async 编排层（document_parse_service）在解析前从系统级
-    ParseConfigService 解析注入（keys: model/base_url/api_key/detail/max_tokens），
-    保证本模块解析函数保持同步、不触碰事件循环；为 None 时回落 settings.VLM_*。
+    VLM 多模态解析的模型配置由调用方（document_parse_service 按策略的
+    vlm_model_ref 异步解析）注入 vlm_* 字段；未注入时回落系统级 settings
+    （settings.VLM_* + DASHSCOPE_API_KEY）。
     """
 
     parse_mode: str = "pymupdf"          # pymupdf | paddleocr | vlm（历史别名: pymupdf_rich | ocr）
@@ -45,7 +61,13 @@ class ParseStrategyConfig:
     split_method: str = "sentence"       # sentence | token | structured
     extract_images: bool = False
     dimension: int = 1536
-    vlm_config: Optional[dict] = None
+    # vlm 模型配置注入（None = 回落 settings）；vlm_model_ref 为策略行的模型引用，
+    # 由 document_parse_service 异步解析后填充其余 vlm_* 字段
+    vlm_model_ref: Optional[str] = None
+    vlm_model: Optional[str] = None
+    vlm_base_url: Optional[str] = None
+    vlm_api_key: Optional[str] = None
+    vlm_detail: Optional[str] = None
 
 
 @dataclass
@@ -147,6 +169,213 @@ SPLIT_HANDLERS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Markdown 按标题切分（代码围栏原子保留）
+# ---------------------------------------------------------------------------
+
+_MD_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+
+
+def _extract_markdown_headings(text: str) -> List[dict]:
+    """提取 Markdown 标题（代码围栏内的 # 行不算标题）。"""
+    headings = []
+    fence = None
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if fence:
+            if stripped.startswith(fence):
+                fence = None
+        elif stripped.startswith("```") or stripped.startswith("~~~"):
+            fence = stripped[:3]
+        else:
+            m = _MD_HEADING_RE.match(line.rstrip("\n"))
+            if m:
+                headings.append({"text": m.group(2).strip(), "level": len(m.group(1)), "pos": pos})
+        pos += len(line)
+    return headings
+
+
+def _markdown_sections(text: str) -> List[tuple]:
+    """按标题行切分为节（代码围栏内的 # 不作为边界）。Returns [(pos, section_text)]。"""
+    sections = []
+    fence = None
+    cur_start = 0
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if fence:
+            if stripped.startswith(fence):
+                fence = None
+        elif stripped.startswith("```") or stripped.startswith("~~~"):
+            fence = stripped[:3]
+        elif _MD_HEADING_RE.match(line.rstrip("\n")) and pos > cur_start:
+            section = text[cur_start:pos]
+            if section.strip():
+                sections.append((cur_start, section))
+            cur_start = pos
+        pos += len(line)
+    tail = text[cur_start:]
+    if tail.strip():
+        sections.append((cur_start, tail))
+    return sections or [(0, text)]
+
+
+def _split_section_blocks(section: str) -> List[str]:
+    """把节拆为原子块：代码围栏整体为一块，其余按空行分段。"""
+    blocks = []
+    cur: List[str] = []
+    fence = None
+    for line in section.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if fence:
+            cur.append(line)
+            if stripped.startswith(fence):
+                blocks.append("".join(cur))
+                cur = []
+                fence = None
+            continue
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            if cur:
+                blocks.append("".join(cur))
+                cur = []
+            fence = stripped[:3]
+            cur.append(line)
+            continue
+        if not line.strip():
+            if cur:
+                blocks.append("".join(cur))
+                cur = []
+            continue
+        cur.append(line)
+    if cur:
+        blocks.append("".join(cur))
+    return blocks
+
+
+def _is_table_block(blk: str) -> bool:
+    """判断块是否为 Markdown 表格（GFM）：含一行分隔行（如 | --- | --- |）。
+
+    表格行间无空行，_split_section_blocks 已整体保为一块；此处用于让
+    超长表格与代码围栏同等原子，不被 _simple_split 按行切散（表头与数据行分离）。
+    """
+    for line in blk.splitlines():
+        s = line.strip()
+        if "|" in s and "-" in s and set(s) <= set("|:- "):
+            return True
+    return False
+
+
+# 父块组上限（字符）：限制兄弟节聚合后的父块体积，兼顾 LLM 上下文预算
+# 与 Milvus metadata JSON 字段容量（64KB，6000 汉字约 18KB UTF-8）。
+_PARENT_GROUP_MAX_CHARS = 6000
+
+
+def _section_heading_level(section: str) -> Optional[int]:
+    """返回节首行标题级别（1~6）；无标题（导言节）返回 None。"""
+    first_line = section.lstrip("\n").split("\n", 1)[0]
+    m = _MD_HEADING_RE.match(first_line.rstrip())
+    return len(m.group(1)) if m else None
+
+
+def _aggregate_section_children(section: str, start: int, child_size: int) -> List[tuple]:
+    """将单个标题节聚合为子块 (pos, child_text) 序列。
+
+    - 节 <= child_size 时整节为一个子块；
+    - 超长节按空行块聚合，代码围栏与表格永远作为原子块不被切开。
+    """
+    if len(section) <= child_size:
+        return [(start, section.rstrip())]
+    pieces = []
+    offset = start
+    cur_parts: List[str] = []
+    cur_len = 0
+    cur_start = start
+    for block in _split_section_blocks(section):
+        blk = block.rstrip("\n")
+        if cur_parts and cur_len + len(blk) > child_size:
+            pieces.append((cur_start, "\n\n".join(cur_parts)))
+            cur_parts, cur_len = [], 0
+            cur_start = offset
+        atomic = blk.lstrip().startswith(("```", "~~~")) or _is_table_block(blk)
+        if not cur_parts and len(blk) > child_size and not atomic:
+            # 普通超长段落退化细分；代码围栏/表格保持原子
+            sub_off = offset
+            for sub in _simple_split(blk, child_size, 0):
+                pieces.append((sub_off, sub))
+                sub_off += len(sub)
+            cur_start = offset + len(block)
+        else:
+            cur_parts.append(blk)
+            cur_len += len(blk) + 2
+        offset += len(block)
+    if cur_parts:
+        pieces.append((cur_start, "\n\n".join(cur_parts)))
+    return pieces or [(start, section.rstrip())]
+
+
+def _markdown_parents(text: str, child_size: int) -> List[dict]:
+    """Markdown 按标题切分为父子结构（small-to-big 检索）。
+
+    父块＝连续的「同级或更深级」标题节贪心聚合而成的组（遇更高级标题或
+    超过 _PARENT_GROUP_MAX_CHARS 才断组）：典型如「报文代码块节 + 后续 N 个
+    同级数据元详解节」合为一个父块，命中任意子块可整组带回，避免兄弟节
+    内容残缺。组内各节再细分为子块（精确检索，代码围栏/表格原子），
+    命中子块后回捞整组内容送 LLM。
+
+    无标题的导言（preamble）独立成组，不吸收后续节。
+
+    Returns:
+        list of {"parent_idx", "parent_pos", "parent_text", "children": [(pos, text)]}
+    """
+    groups: List[List[tuple]] = []
+    anchor_level: Optional[int] = None
+    group_len = 0
+    for start, section in _markdown_sections(text):
+        level = _section_heading_level(section)
+        new_group = (
+            not groups
+            or level is None  # 导言只会是首节，防御性判断
+            or anchor_level is None  # 上一组锚在导言，不吸收
+            or level < anchor_level  # 更高级标题断组
+            or group_len + len(section) > _PARENT_GROUP_MAX_CHARS
+        )
+        if new_group:
+            groups.append([(start, section)])
+            anchor_level = level
+            group_len = len(section)
+        else:
+            groups[-1].append((start, section))
+            group_len += len(section)
+
+    parents = []
+    for pidx, group in enumerate(groups):
+        children: List[tuple] = []
+        for s_start, s_text in group:
+            children.extend(_aggregate_section_children(s_text, s_start, child_size))
+        parents.append({
+            "parent_idx": pidx,
+            "parent_pos": group[0][0],
+            "parent_text": "".join(s for _, s in group).rstrip(),
+            "children": children,
+        })
+    return parents or [{"parent_idx": 0, "parent_pos": 0, "parent_text": text.rstrip(),
+                        "children": [(0, text.rstrip())]}]
+
+
+def _markdown_split(text: str, chunk_size: int) -> List[tuple]:
+    """Markdown 按标题切分为扁平 (pos, chunk_text) 序列（不含父块信息）。
+
+    - 标题（# ~ ######，代码围栏内除外）是切分边界，节内容完整保留；
+    - 超长节按空行分块聚合，代码围栏永远作为原子块不被切开；
+    - 标题边界即语义边界，不做 overlap。
+    """
+    pieces = []
+    for parent in _markdown_parents(text, chunk_size):
+        pieces.extend(parent["children"])
+    return pieces or [(0, text)]
+
+
 def _split_by_page_headings(text: str, page_headings: List[dict], strategy: ParseStrategyConfig) -> List[tuple]:
     """按提取到的真实标题位置切分页面文本。
 
@@ -188,6 +417,7 @@ def split_pages_to_chunks(pages: List[ParsedPage], strategy: ParseStrategyConfig
 
     for page in pages:
         text = page.text or ""
+        piece_parents: List[Optional[tuple]] = []  # 与 pieces 对齐：每个子块的 (parent_id, parent_text) 或 None
         page_headings = sorted(page.headings or [], key=lambda h: h.get("pos", 0))
         # 页面级图片（VLM 整页分析等无占位符模式）：整页文本中没有任何 IMG
         # 占位符时，将 page.images 作为页级引用附加到该页每个 chunk，
@@ -195,7 +425,22 @@ def split_pages_to_chunks(pages: List[ParsedPage], strategy: ParseStrategyConfig
         page_image_ids = [img["image_id"] for img in (page.images or []) if img.get("image_id")]
         page_has_placeholders = bool(re.search(IMG_PLACEHOLDER_PATTERN, text))
 
-        if strategy.split_method == "structured" and page_headings:
+        if getattr(page, "content_format", "plain") == "markdown":
+            # Markdown 强制按标题切分（代码围栏原子保留），无视 split_method：
+            # sentence/token 等通用切分会把完整代码块/报文切碎，检索命中的
+            # 片段残缺会误导 LLM 基于半截内容自由发挥。
+            # 父子分块：子块精确检索，多子块的父节内容回捞送 LLM（见
+            # rag_pipeline._expand_to_parents）；单子块节无需父块（子即父）。
+            pieces = []
+            for parent in _markdown_parents(text, strategy.chunk_size):
+                children = parent["children"]
+                parent_meta = None
+                if len(children) > 1:
+                    parent_meta = (f"{doc_id}_parent_{parent['parent_idx']:04d}", parent["parent_text"])
+                for cpos, ctext in children:
+                    pieces.append((cpos, ctext))
+                    piece_parents.append(parent_meta)
+        elif strategy.split_method == "structured" and page_headings:
             # structured 模式优先使用真实标题切分
             pieces = _split_by_page_headings(text, page_headings, strategy)
         else:
@@ -210,7 +455,7 @@ def split_pages_to_chunks(pages: List[ParsedPage], strategy: ParseStrategyConfig
                 cursor = pos + max(len(chunk_text), 1)
 
         applied_idx = 0
-        for pos, chunk_text in pieces:
+        for piece_idx, (pos, chunk_text) in enumerate(pieces):
             # 应用位于该 chunk 之前的标题，维护层级栈
             while applied_idx < len(page_headings) and page_headings[applied_idx].get("pos", 0) <= pos:
                 h = page_headings[applied_idx]
@@ -221,7 +466,7 @@ def split_pages_to_chunks(pages: List[ParsedPage], strategy: ParseStrategyConfig
             img_ids = re.findall(IMG_PLACEHOLDER_PATTERN, chunk_text)
             if page_image_ids and not page_has_placeholders:
                 img_ids = list(dict.fromkeys([*img_ids, *page_image_ids]))
-            chunks.append({
+            chunk = {
                 "chunk_id": f"{doc_id}_chunk_{chunk_index:04d}",
                 "doc_id": doc_id,
                 "page": page.page_number,
@@ -229,7 +474,11 @@ def split_pages_to_chunks(pages: List[ParsedPage], strategy: ParseStrategyConfig
                 "image_ids": img_ids,
                 "heading": heading_path(),
                 "chunk_type": "text",
-            })
+            }
+            parent_meta = piece_parents[piece_idx] if piece_idx < len(piece_parents) else None
+            if parent_meta:
+                chunk["parent_id"], chunk["parent_content"] = parent_meta
+            chunks.append(chunk)
             chunk_index += 1
 
         # 应用页面剩余标题，作为表格 chunk 的上下文
@@ -260,46 +509,98 @@ def split_pages_to_chunks(pages: List[ParsedPage], strategy: ParseStrategyConfig
 # 图片提取（纯同步，仅返回二进制数据，不调用异步 OSS 上传）
 # ---------------------------------------------------------------------------
 
-def _extract_images_raw(doc: fitz.Document, doc_id: str) -> List[dict]:
-    """从 PDF 中提取图片原始数据。返回包含二进制数据和元数据的列表。
+_IMAGE_RENDER_ZOOM = 2.0        # 渲染缩放下限（低分辨率原图的清晰度兜底）
+_IMAGE_MAX_RENDER_ZOOM = 6.0    # 渲染缩放上限（≈432dpi，防止超高分辨率原图产出过大文件）
+_IMAGE_MIN_SIZE_PT = 50.0   # 显示尺寸过滤（pt）：过小的装饰图标/线条跳过
+_IMAGE_MERGE_GAP_PT = 5.0   # 矩形合并间距（pt）：被切成条带的大图垂直相邻，合并复原
 
-    每张图片附带 y_pos（在页面中的纵向坐标，供占位符按阅读顺序插入；
-    定位失败为 None，由组装层决定兜底位置）。
+
+def _merge_image_rects(rects: List["fitz.Rect"], gap: float) -> List["fitz.Rect"]:
+    """合并重叠或近邻（间距 ≤ gap）的矩形，迭代至收敛。
+
+    Word/扫描件导出的 PDF 常把一张视觉大图切成多个条带 xref，
+    逐个提取只能拿到残片；按显示矩形合并后再渲染可复原完整图。
+    """
+    merged = [fitz.Rect(r) for r in rects]
+    changed = True
+    while changed:
+        changed = False
+        out: List[fitz.Rect] = []
+        for r in merged:
+            hit = None
+            for m in out:
+                expanded = fitz.Rect(m.x0 - gap, m.y0 - gap, m.x1 + gap, m.y1 + gap)
+                if expanded.intersects(r):
+                    hit = m
+                    break
+            if hit is not None:
+                hit.include_rect(r)
+                changed = True
+            else:
+                out.append(fitz.Rect(r))
+        merged = out
+    return merged
+
+
+def _extract_images_raw(doc: fitz.Document, doc_id: str) -> List[dict]:
+    """按显示区域渲染提取图片：get_image_rects 定位 + get_pixmap(clip) 渲染。
+
+    旧版用 extract_image(xref) 直取内嵌位图，丢失 PDF 变换矩阵（镜像/旋转
+    错乱）且分条带存储的大图只能取到残片（截断）；改为在页面上按显示
+    矩形渲染，并合并重叠/近邻矩形复原条带图，所见即所得。
+
+    每张图片附带 y_pos（在页面中的纵向坐标，供占位符按阅读顺序插入）。
+    渲染缩放按内嵌图原生像素密度自适应（原生像素 ÷ 显示 pt），尽量还原
+    原始分辨率，避免固定倍数导致高清扫描件/截图发虚。
     """
     raw_images = []
     for page_idx in range(len(doc)):
         page = doc[page_idx]
         page_number = page_idx + 1
-        image_list = page.get_images(full=True)
-        for img_idx, img_info in enumerate(image_list):
-            xref = img_info[0]
-            base_image = doc.extract_image(xref)
-            if not base_image:
-                continue
-            width = base_image.get("width", 0)
-            height = base_image.get("height", 0)
-            if width < 100 or height < 100:
-                continue
-
+        rects: List[fitz.Rect] = []
+        rect_zooms: List[float] = []
+        for img_info in page.get_images(full=True):
+            xref, native_w, native_h = img_info[0], img_info[2], img_info[3]
             try:
-                rects = page.get_image_rects(xref)
-                y_pos = min((r.y0 for r in rects), default=None)
+                for r in page.get_image_rects(xref):
+                    rr = fitz.Rect(r)
+                    rr.intersect(page.rect)  # 裁剪到页面内，避免超出边界的空白
+                    if not rr.is_empty:
+                        rects.append(rr)
+                        # 还原该内嵌图原生分辨率所需的渲染缩放
+                        rect_zooms.append(max(native_w / rr.width, native_h / rr.height))
             except Exception:
-                y_pos = None
+                continue
 
-            image_id = f"{doc_id}_p{page_number}_{img_idx + 1:02d}"
-            ext = base_image.get("ext", "png")
-            content_type = f"image/{ext}" if ext else "image/png"
+        regions = [
+            r for r in _merge_image_rects(rects, _IMAGE_MERGE_GAP_PT)
+            if r.width >= _IMAGE_MIN_SIZE_PT and r.height >= _IMAGE_MIN_SIZE_PT
+        ]
+        regions.sort(key=lambda r: (r.y0, r.x0))
 
+        for seq, rect in enumerate(regions, start=1):
+            # 区域内所有内嵌图的最高原生密度决定缩放，2x 保底、上限封顶
+            zoom = _IMAGE_RENDER_ZOOM
+            for rr, z in zip(rects, rect_zooms):
+                if rect.intersects(rr):
+                    zoom = max(zoom, z)
+            zoom = min(zoom, _IMAGE_MAX_RENDER_ZOOM)
+            try:
+                pix = page.get_pixmap(clip=rect, matrix=fitz.Matrix(zoom, zoom))
+                data = pix.tobytes("png")
+            except Exception:
+                continue
+
+            image_id = f"{doc_id}_p{page_number}_{seq:02d}"
             raw_images.append({
                 "image_id": image_id,
-                "data": base_image["image"],
-                "content_type": content_type,
-                "width": width,
-                "height": height,
+                "data": data,
+                "content_type": "image/png",
+                "width": pix.width,
+                "height": pix.height,
                 "page_number": page_number,
-                "seq": img_idx + 1,
-                "y_pos": y_pos,
+                "seq": seq,
+                "y_pos": rect.y0,
                 "filename": f"{image_id}.png",
             })
     return raw_images
@@ -438,6 +739,11 @@ _TEXT_FILE_EXTS = {".txt", ".md", ".markdown", ".json", ".csv", ".log"}
 
 _IMAGE_FILE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
 
+# Word 文档扩展名：PyMuPDF 不支持 doc/docx，自动路由到 python-docx 转写。
+# .doc 也先尝试按 docx 打开：Windows 上 mimetypes 可能把 docx 的 mime 猜成
+# .doc 后缀，真 docx 内容仍可正常解析；真老格式才报错指引。
+_DOCX_FILE_EXTS = (".docx", ".doc")
+
 
 def _read_text_with_fallback(file_path: str) -> str:
     """读取纯文本文件：优先 UTF-8，失败回退 GBK，最后容错替换。"""
@@ -452,13 +758,135 @@ def _read_text_with_fallback(file_path: str) -> str:
 
 
 def _parse_text_file(file_path: str, doc_id: str, strategy: ParseStrategyConfig) -> ParseResult:
-    """纯文本解析（txt/md/json/csv 等）：整篇读入为单页，交由分块器切分。"""
+    """纯文本解析（txt/md/json/csv 等）：整篇读入为单页，交由分块器切分。
+
+    Markdown 文件额外提取标题并标记 content_format=markdown，
+    分块时强制按标题切分（见 split_pages_to_chunks）。
+    """
     text = _read_text_with_fallback(file_path)
+    is_md = Path(file_path).suffix.lower() in (".md", ".markdown")
+    page = ParsedPage(
+        page_number=1,
+        text=text,
+        headings=_extract_markdown_headings(text) if is_md else [],
+        content_format="markdown" if is_md else "plain",
+    )
     return ParseResult(
         doc_id=doc_id,
-        pages=[ParsedPage(page_number=1, text=text)],
+        pages=[page],
         raw_images=[],
         mode_used="text",
+    )
+
+
+# ---------------------------------------------------------------------------
+# DOCX 解析（python-docx 转写为 Markdown，接入标题切分管线）
+# ---------------------------------------------------------------------------
+
+_DOCX_IMAGE_SUFFIXES = {
+    "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
+    "image/bmp": ".bmp", "image/webp": ".webp",
+}
+
+_DOCX_HEADING_RE = re.compile(r"heading\s*(\d+)", re.IGNORECASE)
+
+
+def _docx_heading_level(para) -> int:
+    """Word 段落样式 -> Markdown 标题级别（1-6）；非标题返回 0。"""
+    try:
+        name = para.style.name or ""
+    except Exception:
+        return 0
+    m = _DOCX_HEADING_RE.match(name.strip())
+    if m:
+        return min(int(m.group(1)), 6)
+    return 1 if name.strip().lower() == "title" else 0
+
+
+def _docx_table_to_markdown(table) -> str:
+    """Word 表格 -> Markdown 表格（合并单元格文本重复展开，可接受）。"""
+    rows = []
+    for r in table.rows:
+        cells = [" ".join(c.text.split()).replace("|", "\\|") for c in r.cells]
+        rows.append("| " + " | ".join(cells) + " |")
+    if not rows:
+        return ""
+    sep = "| " + " | ".join(["---"] * len(table.rows[0].cells)) + " |"
+    return "\n".join([rows[0], sep, *rows[1:]])
+
+
+def _parse_docx_file(file_path: str, doc_id: str, strategy: ParseStrategyConfig) -> ParseResult:
+    """DOCX 解析：按 body 顺序转写为 Markdown，接入标题切分管线。
+
+    - 标题样式（Heading N / Title）-> #/##/### 标题，保留层级语义；
+    - 表格 -> Markdown 表格（切分时按标题路径挂接）；
+    - 内嵌图片 -> 提取二进制 + 段落原位 [IMG:] 占位符（页眉页脚天然省略）；
+    - Word 无固定分页概念，整篇作为单页，分块器按标题切分不受影响。
+
+    所有 parse_mode 均走此路径：PyMuPDF/OCR/VLM 都无法直接打开 Word 格式。
+    """
+    from docx import Document as DocxDocument
+    from docx.oxml.ns import qn
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    try:
+        docx = DocxDocument(file_path)
+    except Exception as e:
+        raise ValueError(
+            "无法解析该 Word 文档：.doc 老格式请先另存为 .docx 再上传"
+        ) from e
+
+    lines: List[str] = []
+    raw_images: List[dict] = []
+    seq = 0
+    for child in docx.element.body.iterchildren():
+        if child.tag == qn("w:p"):
+            para = Paragraph(child, docx)
+            text = para.text.strip()
+            level = _docx_heading_level(para)
+            if text:
+                lines.append(f"{'#' * level} {text}" if level else text)
+            # 段内图片：提取二进制并在段落之后插入占位符
+            for blip in child.iter(qn("a:blip")):
+                rid = blip.get(qn("r:embed"))
+                part = docx.part.related_parts.get(rid) if rid else None
+                data = getattr(part, "blob", None)
+                if not data:
+                    continue
+                seq += 1
+                image_id = f"{doc_id}_p1_{seq:02d}"
+                content_type = getattr(part, "content_type", "") or "image/png"
+                suffix = _DOCX_IMAGE_SUFFIXES.get(content_type, ".png")
+                raw_images.append({
+                    "image_id": image_id,
+                    "data": data,
+                    "content_type": content_type,
+                    "width": None,
+                    "height": None,
+                    "page_number": 1,
+                    "seq": seq,
+                    "filename": f"{image_id}{suffix}",
+                })
+                lines.append(f"[IMG:{image_id}]")
+        elif child.tag == qn("w:tbl"):
+            md = _docx_table_to_markdown(Table(child, docx))
+            if md:
+                lines.append(md)
+
+    text = "\n\n".join(lines)
+    page = ParsedPage(
+        page_number=1,
+        text=text,
+        images=[{"image_id": img["image_id"]} for img in raw_images],
+        headings=_extract_markdown_headings(text),
+        content_format="markdown",
+    )
+    return ParseResult(
+        doc_id=doc_id,
+        pages=[page],
+        raw_images=raw_images,
+        mode_used="docx",
     )
 
 
@@ -468,6 +896,7 @@ def parse_document(file_path: str, doc_id: str, strategy: ParseStrategyConfig) -
     路由规则：
     - 纯文本扩展名（txt/md/json/csv/log）：自动走纯文本解析，无视 parse_mode；
     - 图片扩展名：paddleocr/ocr 模式直接 OCR，其余模式走 VLM 描述；
+    - Word 扩展名（docx/doc）：python-docx 转写为 Markdown，无视 parse_mode；
     - 其余（PDF 等）：按 parse_mode 选择 pymupdf / paddleocr / vlm，
       历史别名 pymupdf_rich 归一为 pymupdf+extract_images，ocr 归一为 paddleocr。
 
@@ -482,6 +911,9 @@ def parse_document(file_path: str, doc_id: str, strategy: ParseStrategyConfig) -
 
     if ext in _IMAGE_FILE_EXTS:
         return _parse_image(file_path, doc_id, strategy)
+
+    if ext in _DOCX_FILE_EXTS:
+        return _parse_docx_file(file_path, doc_id, strategy)
 
     # 历史别名归一（直接改写 strategy，保证 mode_used 与落库 parse_mode 为规范值）
     if strategy.parse_mode == "pymupdf_rich":
@@ -536,77 +968,123 @@ def _parse_with_pymupdf(file_path: str, doc_id: str, strategy: ParseStrategyConf
     )
 
 
-def _resolve_vlm_config(strategy: ParseStrategyConfig) -> dict:
-    """解析生效 VLM 配置：优先 strategy.vlm_config（编排层注入的系统级配置），
-    缺失时回落 settings.VLM_*（env）。"""
-    cfg = strategy.vlm_config or {}
+def _resolve_vlm_config(strategy: Optional[ParseStrategyConfig] = None) -> dict:
+    """解析生效 VLM 配置：优先用策略注入值，缺省回落系统级 settings。"""
+    s = strategy
     return {
-        "model": cfg.get("model") or settings.VLM_MODEL,
-        "base_url": cfg.get("base_url") or settings.VLM_API_BASE,
-        "api_key": cfg.get("api_key") or settings.VLM_API_KEY,
-        "detail": cfg.get("detail") or getattr(settings, "VLM_DETAIL_LEVEL", "high"),
-        "max_tokens": int(cfg.get("max_tokens") or 4096),
+        "model": (s.vlm_model if s else None) or settings.VLM_MODEL,
+        "base_url": (s.vlm_base_url if s else None) or settings.VLM_API_BASE,
+        "api_key": (s.vlm_api_key if s else None) or settings.DASHSCOPE_API_KEY,
+        "detail": (s.vlm_detail if s else None) or getattr(settings, "VLM_DETAIL_LEVEL", "high") or "high",
+        "max_tokens": _VLM_MAX_TOKENS,
     }
 
 
-def _create_vlm_client(strategy: ParseStrategyConfig):
+def _create_vlm_client(strategy: Optional[ParseStrategyConfig] = None):
     """创建 VLM OpenAI 兼容客户端；未配置 API Key 时抛出带配置指引的错误。"""
     from openai import OpenAI
 
     vlm = _resolve_vlm_config(strategy)
     if not vlm["api_key"]:
         raise ValueError(
-            "VLM 视觉解析未配置 API Key，请管理员在「配置中心 - 检索配置」页"
-            "配置 VLM 视觉解析模型（默认 qwen3-vl-flash）"
+            "VLM 多模态解析未配置 API Key，请在模型配置页配置或设置系统环境变量 DASHSCOPE_API_KEY"
         )
     client = OpenAI(api_key=vlm["api_key"], base_url=vlm["base_url"])
     return client, vlm
 
 
+_VLM_MAX_TOKENS = 4096
+
+_VLM_PAGE_PROMPT = """你是专业的文档解析引擎。请把这页文档图片完整转写为规范的 Markdown：
+1. 标题：按文档真实层级输出 #/##/### 标题，普通正文不要误标为标题；
+2. 表格：用 Markdown 表格语法完整输出所有单元格内容；
+3. 图片/图表/流程图：在其原位置用一段文字客观描述内容（含关键数据与流向）；
+4. 正文：保持原文文字，不改写、不总结、不遗漏；页眉、页脚、页码省略；
+5. 只输出 Markdown 内容本身，不要用代码围栏包裹整页输出，不要添加任何解释。"""
+
+
+def _strip_md_fence(text: str) -> str:
+    """剥掉模型偶尔包裹整页输出的 ```markdown 围栏（仅整体包裹时）。"""
+    m = re.match(r"^```[a-zA-Z]*\n([\s\S]*?)\n?```$", text.strip())
+    return m.group(1) if m else text
+
+
+def _vlm_transcribe_page(client, vlm: dict, page: "fitz.Page", heading_stack: List[dict]) -> str:
+    """单页截图 → VLM 转写为结构化 Markdown（base64 data URI 发送）。
+
+    heading_stack 为已解析页的标题层级栈，注入 prompt 保证跨页标题层级连贯。"""
+    import base64
+
+    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+    page_b64 = base64.b64encode(pix.tobytes("png")).decode()
+    prompt = _VLM_PAGE_PROMPT
+    if heading_stack:
+        path = " > ".join(h["text"] for h in heading_stack)
+        prompt += f"\n\n上下文：本页之前的文档标题层级为「{path}」，请据此延续判断本页标题的级别。"
+    response = client.chat.completions.create(
+        model=vlm["model"],
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{page_b64}", "detail": vlm["detail"]}},
+            ],
+        }],
+        max_tokens=vlm["max_tokens"],
+    )
+    _track_vlm_usage(response, vlm["model"])
+    return _strip_md_fence((response.choices[0].message.content or "").strip())
+
+
 def _parse_with_vlm(file_path: str, doc_id: str, strategy: ParseStrategyConfig) -> ParseResult:
-    """VLM 整页分析：每页截图后调用 VLM API。"""
+    """VLM 多模态解析：每页渲染截图 → 多模态模型转写为结构化 Markdown。
+
+    - 输出标记 content_format=markdown + headings，接入既有 Markdown 标题
+      切分管线（标题路径 + 父子分块），保留标题/表格/图表语义；
+    - 串行逐页解析，已解析标题层级注入下一页 prompt，跨页层级连贯；
+    - 单页 VLM 失败降级为 PyMuPDF 文本提取，解析整体不中断；
+    - 图片用区域原图（_extract_images_raw，防镜像/截断）挂页级供检索引用，
+      不再把整页截图当图片入库。
+    """
     client, vlm = _create_vlm_client(strategy)
     doc = fitz.open(file_path)
     pages = []
     raw_images = []
+    heading_stack: List[dict] = []  # 跨页标题层级栈，供下一页 prompt 上下文
     try:
+        # VLM 模式恒提取区域图（多模态解析的图片引用是核心能力，不受 extract_images 开关限制）
+        all_images = _extract_images_raw(doc, doc_id)
         for page_idx in range(len(doc)):
             page = doc[page_idx]
             page_number = page_idx + 1
+            images = [img for img in all_images if img["page_number"] == page_number]
+            raw_images.extend(images)
 
-            mat = fitz.Matrix(2, 2)
-            pix = page.get_pixmap(matrix=mat)
-            page_image_data = pix.tobytes("png")
+            try:
+                text = _vlm_transcribe_page(client, vlm, page, heading_stack)
+                content_format = "markdown"
+                headings = _extract_markdown_headings(text)
+            except Exception as e:
+                # 单页失败降级：该页回退 PyMuPDF 文本提取，不中断整体解析
+                logger.warning("VLM 解析第 %s 页失败，降级为 PyMuPDF 文本提取: %s", page_number, e)
+                text = page.get_text()
+                content_format = "plain"
+                headings = []
 
-            # 将页面图片作为 raw_image 返回（后续由调用方上传）
-            image_id = f"{doc_id}_p{page_number}_page"
-            raw_images.append({
-                "image_id": image_id,
-                "data": page_image_data,
-                "content_type": "image/png",
-                "width": pix.width,
-                "height": pix.height,
-                "page_number": page_number,
-                "seq": 1,
-                "filename": f"{image_id}.png",
-            })
+            # 维护跨页标题层级栈（与 split_pages_to_chunks 的栈逻辑一致）
+            for h in headings:
+                while heading_stack and heading_stack[-1]["level"] >= h["level"]:
+                    heading_stack.pop()
+                heading_stack.append({"level": h["level"], "text": h["text"]})
 
-            import base64
-            page_b64 = base64.b64encode(page_image_data).decode()
-            prompt = f"请详细分析这个文档页面（第{page_number}页）的内容。完整提取文字、描述图表、识别表格并输出Markdown。"
-            response = client.chat.completions.create(
-                model=vlm["model"],
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{page_b64}", "detail": vlm["detail"]}},
-                    ],
-                }],
-                max_tokens=vlm["max_tokens"],
-            )
-            analysis = response.choices[0].message.content or ""
-            pages.append(ParsedPage(page_number=page_number, text=analysis, images=[{"image_id": image_id}], tables=[]))
+            pages.append(ParsedPage(
+                page_number=page_number,
+                text=text,
+                images=[{"image_id": img["image_id"]} for img in images],
+                tables=[],
+                headings=headings,
+                content_format=content_format,
+            ))
     finally:
         doc.close()
 
@@ -692,6 +1170,8 @@ def _ocr_one_image(image) -> str:
     """对单张图像（BGR ndarray 或图片文件路径）执行 OCR，返回拼接文本。"""
     ocr = _get_paddle_ocr()
     results = ocr.predict([image]) or []
+    # 用量埋点：本地推理无 token，以图像张数（调用次数）计量
+    usage_service.track("ocr", "paddleocr", scene="parse", extra={"image_count": 1})
     if not results:
         return ""
     return _ocr_result_to_text(results[0])
@@ -798,6 +1278,7 @@ def _parse_image(file_path: str, doc_id: str, strategy: ParseStrategyConfig) -> 
         }],
         max_tokens=vlm["max_tokens"],
     )
+    _track_vlm_usage(response, vlm["model"])
     text = response.choices[0].message.content or ""
 
     image_id = f"{doc_id}_img_01"

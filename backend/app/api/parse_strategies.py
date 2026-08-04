@@ -36,6 +36,7 @@ async def list_strategies(current_user: User = Depends(get_current_user)):
                 dimension=s.dimension,
                 split_method=s.split_method,
                 extract_images=s.extract_images,
+                vlm_model_ref=s.vlm_model_ref,
                 created_at=s.created_at,
                 updated_at=s.updated_at,
             )
@@ -60,6 +61,7 @@ async def create_strategy(
             dimension=request.dimension,
             split_method=request.split_method.value,
             extract_images=request.extract_images,
+            vlm_model_ref=request.vlm_model_ref,
         )
         await parse_strategy_repo.create(session, strategy)
         await session.commit()
@@ -76,6 +78,7 @@ async def create_strategy(
             dimension=strategy.dimension,
             split_method=strategy.split_method,
             extract_images=strategy.extract_images,
+            vlm_model_ref=strategy.vlm_model_ref,
             created_at=strategy.created_at,
             updated_at=strategy.updated_at,
         ).model_dump()
@@ -110,6 +113,8 @@ async def update_strategy(
             strategy.split_method = request.split_method.value
         if request.extract_images is not None:
             strategy.extract_images = request.extract_images
+        if request.vlm_model_ref is not None:
+            strategy.vlm_model_ref = request.vlm_model_ref or None
         if request.is_default is not None:
             if request.is_default:
                 await parse_strategy_repo.clear_default_by_user(session, str(current_user.id))
@@ -130,6 +135,7 @@ async def update_strategy(
             dimension=strategy.dimension,
             split_method=strategy.split_method,
             extract_images=strategy.extract_images,
+            vlm_model_ref=strategy.vlm_model_ref,
             created_at=strategy.created_at,
             updated_at=strategy.updated_at,
         ).model_dump()

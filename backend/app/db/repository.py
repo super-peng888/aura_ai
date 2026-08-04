@@ -9,7 +9,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
     Document,
-    DocumentChunk,
     DocumentImage,
     User,
     Conversation,
@@ -26,7 +25,11 @@ from app.db.models import (
     ParseStrategy,
     UserModelConfig,
     SystemRetrievalConfig,
-    SystemParseConfig,
+    SystemModelSetting,
+    ModelProvider,
+    ProviderModel,
+    SystemModelAssignment,
+    MCPServer,
     KGEntity,
     KGRelation,
     KGChunkEntity,
@@ -76,23 +79,6 @@ class DocumentRepository(BaseRepository[Document]):
         return result.scalars().all()
 
 
-class ChunkRepository(BaseRepository[DocumentChunk]):
-    def __init__(self):
-        super().__init__(DocumentChunk)
-
-    async def list_by_document(self, session: AsyncSession, document_id: str) -> Sequence[DocumentChunk]:
-        stmt = select(DocumentChunk).where(DocumentChunk.document_id == document_id).order_by(DocumentChunk.chunk_index)
-        result = await session.execute(stmt)
-        return result.scalars().all()
-
-    async def get_by_milvus_ids(self, session: AsyncSession, milvus_ids: List[str]) -> Sequence[DocumentChunk]:
-        if not milvus_ids:
-            return []
-        stmt = select(DocumentChunk).where(DocumentChunk.milvus_id.in_(milvus_ids))
-        result = await session.execute(stmt)
-        return result.scalars().all()
-
-
 class ImageRepository(BaseRepository[DocumentImage]):
     def __init__(self):
         super().__init__(DocumentImage)
@@ -108,6 +94,10 @@ class ImageRepository(BaseRepository[DocumentImage]):
         stmt = select(DocumentImage).where(DocumentImage.document_id == document_id).order_by(DocumentImage.page_number)
         result = await session.execute(stmt)
         return result.scalars().all()
+
+    async def delete_by_document(self, session: AsyncSession, document_id: str) -> None:
+        await session.execute(delete(DocumentImage).where(DocumentImage.document_id == document_id))
+        await session.flush()
 
 
 class UserRepository(BaseRepository[User]):
@@ -365,6 +355,26 @@ class PromptTemplateRepository(BaseRepository[PromptTemplate]):
         return result.scalars().all()
 
 
+class MCPServerRepository(BaseRepository[MCPServer]):
+    def __init__(self):
+        super().__init__(MCPServer)
+
+    async def list_all(self, session: AsyncSession) -> Sequence[MCPServer]:
+        stmt = select(MCPServer).order_by(MCPServer.created_at.asc())
+        result = await session.execute(stmt)
+        return result.scalars().all()
+
+    async def list_enabled(self, session: AsyncSession) -> Sequence[MCPServer]:
+        stmt = select(MCPServer).where(MCPServer.enabled == True).order_by(MCPServer.created_at.asc())
+        result = await session.execute(stmt)
+        return result.scalars().all()
+
+    async def get_by_name(self, session: AsyncSession, name: str) -> Optional[MCPServer]:
+        stmt = select(MCPServer).where(MCPServer.name == name)
+        result = await session.execute(stmt)
+        return result.scalar_one_or_none()
+
+
 class ParseStrategyRepository(BaseRepository[ParseStrategy]):
     def __init__(self):
         super().__init__(ParseStrategy)
@@ -472,7 +482,7 @@ class RetrievalConfigRepository(BaseRepository[SystemRetrievalConfig]):
     UPDATABLE_FIELDS = (
         "rerank_top_k", "similarity_threshold",
         "enable_query_rewrite", "enable_keyword_search", "enable_vector_search", "enable_rerank",
-        "rag_mode", "enable_graph_rag", "graph_search_mode",
+        "enable_graph_rag", "graph_search_mode",
     )
 
     def __init__(self):
@@ -494,30 +504,109 @@ class RetrievalConfigRepository(BaseRepository[SystemRetrievalConfig]):
         return existing
 
 
-class ParseConfigRepository(BaseRepository[SystemParseConfig]):
-    """系统级解析配置（单行表，VLM 视觉解析模型）。"""
-
-    UPDATABLE_FIELDS = (
-        "vlm_model", "vlm_base_url", "vlm_api_key", "vlm_detail_level", "vlm_max_tokens",
-    )
+class SystemModelSettingRepository(BaseRepository[SystemModelSetting]):
+    """DEPRECATED：旧系统模型表，仅供 seed 历史迁移读取。"""
 
     def __init__(self):
-        super().__init__(SystemParseConfig)
+        super().__init__(SystemModelSetting)
 
-    async def get_singleton(self, session: AsyncSession) -> Optional[SystemParseConfig]:
-        stmt = select(SystemParseConfig).limit(1)
+    async def get_by_type(self, session: AsyncSession, model_type: str) -> Optional[SystemModelSetting]:
+        stmt = select(SystemModelSetting).where(SystemModelSetting.model_type == model_type)
         result = await session.execute(stmt)
-        return result.scalar_one_or_none()
+        return result.scalars().first()
 
-    async def upsert(self, session: AsyncSession, config: SystemParseConfig) -> SystemParseConfig:
-        existing = await self.get_singleton(session)
-        if existing is None:
-            return await self.create(session, config)
-        for field in self.UPDATABLE_FIELDS:
-            setattr(existing, field, getattr(config, field))
-        await session.flush()
-        await session.refresh(existing)
-        return existing
+    async def list_general(self, session: AsyncSession) -> Sequence[SystemModelSetting]:
+        """通用模型列表（multi_modal / ordinary），按创建时间排序。"""
+        stmt = (
+            select(SystemModelSetting)
+            .where(SystemModelSetting.model_type.in_(("multi_modal", "ordinary")))
+            .order_by(SystemModelSetting.created_at)
+        )
+        result = await session.execute(stmt)
+        return result.scalars().all()
+
+
+class ModelProviderRepository(BaseRepository[ModelProvider]):
+    """模型供应商：系统（owner_id NULL）+ 用户私有。"""
+
+    def __init__(self):
+        super().__init__(ModelProvider)
+
+    async def list_system(self, session: AsyncSession) -> Sequence[ModelProvider]:
+        stmt = (
+            select(ModelProvider)
+            .where(ModelProvider.owner_id.is_(None))
+            .order_by(ModelProvider.created_at)
+        )
+        result = await session.execute(stmt)
+        return result.scalars().all()
+
+    async def list_by_owner(self, session: AsyncSession, owner_id: str) -> Sequence[ModelProvider]:
+        stmt = (
+            select(ModelProvider)
+            .where(ModelProvider.owner_id == owner_id)
+            .order_by(ModelProvider.created_at)
+        )
+        result = await session.execute(stmt)
+        return result.scalars().all()
+
+
+class ProviderModelRepository(BaseRepository[ProviderModel]):
+    """供应商下的模型。"""
+
+    def __init__(self):
+        super().__init__(ProviderModel)
+
+    async def exists_dup(
+        self, session: AsyncSession, provider_id: str, model: str, capability: str,
+        exclude_id: Optional[str] = None,
+    ) -> bool:
+        """同供应商下同模型名+同能力是否已存在（去重校验）。"""
+        stmt = select(func.count()).select_from(ProviderModel).where(
+            ProviderModel.provider_id == provider_id,
+            ProviderModel.model == model,
+            ProviderModel.capability == capability,
+        )
+        if exclude_id:
+            stmt = stmt.where(ProviderModel.id != exclude_id)
+        return bool(await session.scalar(stmt))
+
+    async def first_system_by_capability(
+        self, session: AsyncSession, capability: str
+    ) -> Optional[ProviderModel]:
+        """系统供应商下按创建时间最早的指定能力模型（chat/general 回落用）。"""
+        stmt = (
+            select(ProviderModel)
+            .join(ModelProvider, ProviderModel.provider_id == ModelProvider.id)
+            .where(
+                ModelProvider.owner_id.is_(None),
+                ProviderModel.capability == capability,
+            )
+            .order_by(ProviderModel.created_at)
+            .limit(1)
+        )
+        result = await session.execute(stmt)
+        return result.scalars().first()
+
+
+class SystemModelAssignmentRepository(BaseRepository[SystemModelAssignment]):
+    """系统角色指派：role → provider_models.id。"""
+
+    def __init__(self):
+        super().__init__(SystemModelAssignment)
+
+    async def get_map(self, session: AsyncSession) -> dict:
+        """返回 {role: model_id|None} 全量映射。"""
+        result = await session.execute(select(SystemModelAssignment))
+        return {row.role: row.model_id for row in result.scalars().all()}
+
+    async def set(self, session: AsyncSession, role: str, model_id: Optional[str]) -> None:
+        """upsert 单个角色指派（不提交，由调用方 commit）。"""
+        row = await session.get(SystemModelAssignment, role)
+        if row is None:
+            session.add(SystemModelAssignment(role=role, model_id=model_id))
+        else:
+            row.model_id = model_id
 
 
 class DataPermissionRepository(BaseRepository["DataPermission"]):
@@ -796,7 +885,6 @@ class KnowledgeGraphRepository:
 
 # Global singletons
 document_repo = DocumentRepository()
-chunk_repo = ChunkRepository()
 image_repo = ImageRepository()
 user_repo = UserRepository()
 conversation_repo = ConversationRepository()
@@ -810,11 +898,15 @@ audit_repo = AuditLogRepository()
 document_version_repo = DocumentVersionRepository()
 prompt_template_repo = PromptTemplateRepository()
 parse_strategy_repo = ParseStrategyRepository()
+mcp_server_repo = MCPServerRepository()
 data_source_repo = DataSourceRepository()
 bi_query_log_repo = BIQueryLogRepository()
 bi_report_repo = BIReportRepository()
 data_permission_repo = DataPermissionRepository()
 user_model_config_repo = UserModelConfigRepository()
 retrieval_config_repo = RetrievalConfigRepository()
-parse_config_repo = ParseConfigRepository()
+system_model_repo = SystemModelSettingRepository()
+model_provider_repo = ModelProviderRepository()
+provider_model_repo = ProviderModelRepository()
+system_model_assignment_repo = SystemModelAssignmentRepository()
 kg_repo = KnowledgeGraphRepository()

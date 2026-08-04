@@ -47,35 +47,26 @@ services:
     networks:
       - aura-network
 
-  minio:
-    container_name: aura-milvus-minio
-    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
-    environment:
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
-    ports:
-      - "9001:9001"
-      - "9002:9000"
-    volumes:
-      - minio_data:/minio_data
-    command: minio server /minio_data --console-address ":9001"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9002/minio/health/live"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
-    networks:
-      - aura-network
+  # [已移除] Milvus 自带的 MinIO —— 对象存储改用已在 Docker 中部署的 RustFS
+  # （S3 兼容，见 milvus-standalone 的 MINIO_* 环境变量）。原 9001 控制台端口
+  # 也与 RustFS 冲突，故一并去除。
 
   milvus-standalone:
     container_name: aura-milvus
-    image: milvusdb/milvus:v2.4.0
+    image: milvusdb/milvus:v2.5.14
     command: ["milvus", "run", "standalone"]
     security_opt:
       - seccomp:unconfined
     environment:
       ETCD_ENDPOINTS: etcd:2379
-      MINIO_ADDRESS: minio:9000
+      # 对象存储：使用宿主机上已部署的 RustFS（S3 兼容），经 host.docker.internal 访问
+      MINIO_ADDRESS: host.docker.internal:9000
+      MINIO_ACCESS_KEY_ID: rustfsadmin
+      MINIO_SECRET_ACCESS_KEY: rustfsadmin
+      MINIO_USE_SSL: "false"
+      MINIO_BUCKET_NAME: milvus
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - milvus_data:/var/lib/milvus
     ports:
@@ -83,33 +74,33 @@ services:
       - "9091:9091"
     depends_on:
       - etcd
-      - minio
     networks:
       - aura-network
 
   # ==========================================================================
-  # MinIO (Application OSS)
+  # Attu (Milvus 图形化管理工具)
+  # 访问：http://localhost:3300  （连接地址留空或填 milvus-standalone:19530）
+  # 版本对齐 Milvus 2.5.x；Attu 容器内部监听 3000，映射到宿主机 3300
+  # （前端已占 3000、后端已占 8000）。
   # ==========================================================================
-  oss:
-    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
-    container_name: aura-oss
+  attu:
+    image: zilliz/attu:v2.5
+    container_name: aura-milvus-attu
     restart: unless-stopped
     environment:
-      MINIO_ROOT_USER: ${OSS_ACCESS_KEY:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${OSS_SECRET_KEY:-minioadmin}
-    volumes:
-      - oss_data:/data
+      MILVUS_URL: milvus-standalone:19530
     ports:
-      - "9000:9000"
-      - "9003:9003"
-    command: server /data --console-address ":9003"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
+      - "3300:3000"
+    depends_on:
+      - milvus-standalone
     networks:
       - aura-network
+
+  # ==========================================================================
+  # 应用 OSS —— 已改用宿主机上部署的 RustFS（S3 兼容，端口 9000）。
+  # 原 MinIO(aura-oss) 与 RustFS 争用 9000 端口且功能重复，故移除。
+  # 应用通过 .env 的 OSS_ENDPOINT=http://localhost:9000 连接 RustFS。
+  # ==========================================================================
 
   # ==========================================================================
   # Python Service
@@ -183,19 +174,10 @@ services:
       - aura-network
 
   # ==========================================================================
-  # Qdrant (Mem0 长期记忆向量存储)
+  # [已移除] Qdrant —— Mem0 长期记忆改用系统 Milvus（collection: mem0_memories），
+  # 与 document_chunks 共用同一 Milvus 实例，统一由 RustFS 承载对象存储，降低运维成本。
+  # 如需回退：重新启用本服务并设 MEM0_VECTOR_STORE_PROVIDER=qdrant。
   # ==========================================================================
-  qdrant:
-    image: qdrant/qdrant:latest
-    container_name: aura-qdrant
-    restart: unless-stopped
-    ports:
-      - "6333:6333"
-      - "6334:6334"
-    volumes:
-      - qdrant_data:/qdrant/storage
-    networks:
-      - aura-network
 
   # ==========================================================================
   # Redis (Optional - for caching / session)
@@ -214,11 +196,8 @@ services:
 volumes:
   postgres_data:
   etcd_data:
-  minio_data:
   milvus_data:
-  oss_data:
   redis_data:
-  qdrant_data:
 
 networks:
   aura-network:

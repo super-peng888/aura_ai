@@ -1,4 +1,4 @@
-"""Agentic 工具调用循环的检索工具与模型解析（rag_mode="agentic"）。
+"""Agentic 工具调用循环的检索工具与模型解析（rag 意图恒走 agentic 循环）。
 
 - knowledge_search：暴露给 LLM 的知识库检索工具（bind_tools）
 - _run_knowledge_search：工具循环共享的检索执行体（文本 + 结构化 contexts）
@@ -32,6 +32,11 @@ async def knowledge_search(query: str, top_k: int = 5) -> str:
     return text_out
 
 
+# 单片段送 LLM 的字符上限：需容纳父子分块回捞的完整父块组（与
+# document_parser._PARENT_GROUP_MAX_CHARS 对齐），截短会导致代码块/详解列表残缺。
+_FRAGMENT_MAX_CHARS = 6000
+
+
 async def _run_knowledge_search(
     query: str,
     top_k: int = 5,
@@ -49,7 +54,7 @@ async def _run_knowledge_search(
     lines = []
     for i, c in enumerate(contexts, 1):
         lines.append(
-            f"[片段{i}] (document_id={c['document_id']}, page={c.get('page_number')})\n{c['content'][:800]}"
+            f"[片段{i}] (document_id={c['document_id']}, page={c.get('page_number')})\n{c['content'][:_FRAGMENT_MAX_CHARS]}"
         )
     return "\n\n".join(lines), contexts
 

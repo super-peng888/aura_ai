@@ -1,8 +1,10 @@
 """文档解析编排服务（Phase 2 自 app.api.documents 下沉）。
 
-职责：下载源文件 -> 解析 -> 图片上传 OSS -> 分块 -> PG 元数据落库 -> 索引（队列或同步），
+职责：下载源文件 -> 解析 -> 图片上传 OSS -> 分块 -> PG 图片元数据落库 -> 索引（队列或同步），
 并统一 sync（parse-sync）/ async（index worker）两条路径的 parse_status 状态机：
 running -> indexing（异步，索引交 worker）/ completed（同步），异常 -> failed。
+
+分块内容不再写入 PG（Milvus 的 content+metadata 已完整承载分块数据）。
 
 索引完成后的 GraphRAG 图谱构建（build_graph_after_index）由本模块统一提供，
 sync 路径与 index worker 共用，受检索配置 enable_graph_rag 开关控制。
@@ -10,13 +12,15 @@ sync 路径与 index worker 共用，受检索配置 enable_graph_rag 开关控�
 
 import asyncio
 import logging
+import mimetypes
 import os
 import tempfile
+from typing import Optional
 
 from app.db.base import AsyncSessionLocal
-from app.db.models import DocumentChunk, DocumentImage
+from app.db.models import DocumentImage
+from app.config import get_settings
 from app.db.repository import (
-    chunk_repo,
     document_repo,
     image_repo,
     parse_strategy_repo,
@@ -29,10 +33,37 @@ from app.services.document_parser import (
     split_pages_to_chunks,
 )
 from app.services.index_queue import enqueue_index_task
-from app.services.parse_config_service import parse_config_service
 from app.services.retrieval_config_service import retrieval_config_service
 
 logger = logging.getLogger(__name__)
+settings = get_settings()
+
+
+# Office 类 mime 显式后缀映射：Windows 上 mimetypes 受注册表影响，可能把
+# docx 的 mime 猜成 .doc，导致解析路由/报错文案错乱，故不依赖系统猜测。
+_MIME_SUFFIX_OVERRIDES = {
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.ms-excel": ".xls",
+}
+
+
+def resolve_temp_suffix(filename: str, original_name: str = "", mime_type: str = "") -> str:
+    """推断下载源文件的临时后缀。
+
+    解析路由（parse_document 按 path.suffix 区分 文本/图片/PDF）与 PyMuPDF/OCR
+    均依赖文件扩展名，缺失会导致 "cannot find document handler"。上传时
+    filename 由 mimetypes 推断，在 Windows 上可能因注册表缺失而为空，故依次
+    回退到用户原始文件名 original_name，最后按 mime_type 猜测。
+    """
+    for name in (filename, original_name):
+        ext = os.path.splitext(name or "")[1]
+        if ext:
+            return ext
+    if mime_type:
+        return _MIME_SUFFIX_OVERRIDES.get(mime_type) or mimetypes.guess_extension(mime_type) or ""
+    return ""
 
 
 class DocumentNotFoundError(Exception):
@@ -59,6 +90,7 @@ def _strategy_from_row(strategy) -> ParseStrategyConfig:
         split_method=strategy.split_method,
         extract_images=strategy.extract_images,
         dimension=strategy.dimension,
+        vlm_model_ref=strategy.vlm_model_ref,
     )
 
 
@@ -89,12 +121,52 @@ def _apply_strategy_override(strategy: ParseStrategyConfig, override) -> ParseSt
     return strategy
 
 
+async def _inject_vlm_config(session, strategy: ParseStrategyConfig, user_id: Optional[str] = None) -> ParseStrategyConfig:
+    """parse_mode=vlm 时按 vlm_model_ref 解析多模态模型配置并注入 vlm_* 字段。
+
+    None/'system' → 跟随系统 VLM 角色（system_model_service.resolve("general")）；
+    具体 id → provider_models（需 capability=multi_modal，且为系统或本人私有
+    供应商下的模型），缺失或不满足时回落系统 VLM 角色并记 warning。
+    document_parser 在线程池同步执行不能查库，故在此异步解析后注入。
+    """
+    if strategy.parse_mode != "vlm":
+        return strategy
+
+    ref = strategy.vlm_model_ref
+    if ref and ref != "system":
+        from app.db.repository import provider_model_repo
+        from app.services.llm_service import decrypt_api_key
+        from app.services.system_model_service import _env_api_key_by_name, _env_key_name
+
+        row = await provider_model_repo.get(session, ref)
+        owner_ok = row is not None and (
+            row.provider.owner_id is None or row.provider.owner_id == user_id
+        )
+        if row and row.capability == "multi_modal" and owner_ok:
+            api_key = decrypt_api_key(row.provider.api_key) if row.provider.api_key else ""
+            if not api_key:
+                api_key = _env_api_key_by_name(_env_key_name(row.provider.base_url, row.model))
+            strategy.vlm_model = row.model
+            strategy.vlm_base_url = row.provider.base_url
+            strategy.vlm_api_key = api_key
+            return strategy
+        logger.warning("解析策略引用的多模态模型 %s 不存在或不可用，回落系统 VLM 角色", ref)
+
+    from app.services.system_model_service import system_model_service
+
+    general = await system_model_service.resolve("general")
+    strategy.vlm_model = general["model"]
+    strategy.vlm_base_url = general["base_url"]
+    strategy.vlm_api_key = general["api_key"]
+    return strategy
+
+
 async def resolve_strategy(session, user_id: str, document=None, override=None) -> ParseStrategyConfig:
     """解析生效的解析策略。
 
     基底优先级：显式 strategy_id > document.strategy_id > 用户默认策略 > 系统默认；
     内联参数（parse_mode/chunk_size/chunk_overlap/split_method/extract_images）
-    在基底策略上覆盖。
+    在基底策略上覆盖；parse_mode=vlm 时按 vlm_model_ref 注入多模态模型配置。
     """
     strategy_row = None
     explicit_strategy_id = getattr(override, "strategy_id", None) if override else None
@@ -107,7 +179,8 @@ async def resolve_strategy(session, user_id: str, document=None, override=None) 
         config = _strategy_from_row(strategy_row)
     else:
         config = await get_user_strategy(session, user_id)
-    return _apply_strategy_override(config, override)
+    config = _apply_strategy_override(config, override)
+    return await _inject_vlm_config(session, config, user_id)
 
 
 async def upload_raw_images(raw_images: list, doc_id: str) -> list:
@@ -137,26 +210,17 @@ async def upload_raw_images(raw_images: list, doc_id: str) -> list:
 
 async def save_parse_metadata(
     document_id: str,
-    chunks: list[dict],
     uploaded_images: list[dict],
-    strategy: ParseStrategyConfig,
 ) -> None:
-    """Persist chunk and image metadata to PostgreSQL with a pending milvus_id.
+    """持久化图片元数据到 PostgreSQL。
 
+    分块内容不再写 PG：Milvus 的 content 字段即原始分块数据，metadata 含
+    page/chunk_index/image_ids 等，可按 document_id 标量查询，无需关系库冗余存储。
     自包含 session（AsyncSessionLocal）并显式 commit，调用方无需管理事务。
+    重新解析时先清理旧图片记录，避免 image_ref_id（确定性命名）唯一约束冲突。
     """
     async with AsyncSessionLocal() as session:
-        for idx, chunk in enumerate(chunks):
-            db_chunk = DocumentChunk(
-                document_id=document_id,
-                content=chunk["content"],
-                milvus_id="pending",
-                page_number=chunk.get("page"),
-                chunk_index=idx,
-                image_ids=chunk.get("image_ids", []),
-            )
-            await chunk_repo.create(session, db_chunk)
-
+        await image_repo.delete_by_document(session, document_id)
         for img in uploaded_images:
             db_image = DocumentImage(
                 document_id=document_id,
@@ -167,65 +231,6 @@ async def save_parse_metadata(
                 height=img.get("height"),
             )
             await image_repo.create(session, db_image)
-
-        await session.commit()
-
-
-def _resolve_chunk_index(chunk_payload: dict, fallback: int) -> int:
-    """解析 chunk payload 对应的 PG chunk_index。
-
-    优先从 chunk_id 后缀解析（split_pages_to_chunks 生成的 chunk_id 形如
-    ``{doc_id}_chunk_{idx:04d}``，后缀即 chunk_index），其次显式 chunk_index
-    字段，最后退化为 payload 在列表中的位置。
-    """
-    chunk_id = chunk_payload.get("chunk_id")
-    if chunk_id:
-        try:
-            return int(str(chunk_id).rsplit("_chunk_", 1)[1])
-        except (IndexError, ValueError):
-            pass
-    chunk_index = chunk_payload.get("chunk_index")
-    if isinstance(chunk_index, int):
-        return chunk_index
-    return fallback
-
-
-async def update_chunk_milvus_ids(document_id: str, chunks: list[dict], milvus_ids: list[str]) -> None:
-    """索引完成后回填各 chunk 的 milvus_id 并显式 commit 落库。
-
-    sync（parse-sync）与 async（index worker）两条索引路径共用的唯一实现。
-    milvus_ids 与 chunks 顺序对齐（indexer.index_document 的返回约定）；
-    到 PG chunk 记录的映射按 chunk_id（后缀即 chunk_index）定位，比按列表
-    位置对齐更防乱序；PG 中无匹配记录时兜底新建。
-    自包含 session（AsyncSessionLocal），调用方无需管理事务。
-    """
-    if not chunks or not milvus_ids:
-        return
-    if len(chunks) != len(milvus_ids):
-        logger.warning(
-            "update_chunk_milvus_ids: document %s chunks(%d) 与 milvus_ids(%d) 长度不一致，按较短者对齐",
-            document_id, len(chunks), len(milvus_ids),
-        )
-
-    async with AsyncSessionLocal() as session:
-        db_chunks = await chunk_repo.list_by_document(session, document_id)
-        db_by_index = {c.chunk_index: c for c in db_chunks}
-
-        for pos, (chunk_payload, milvus_id) in enumerate(zip(chunks, milvus_ids)):
-            chunk_index = _resolve_chunk_index(chunk_payload, pos)
-            db_chunk = db_by_index.get(chunk_index)
-            if db_chunk is not None:
-                db_chunk.milvus_id = str(milvus_id)
-            else:
-                # Fallback: create chunk record if missing
-                session.add(DocumentChunk(
-                    document_id=document_id,
-                    content=chunk_payload["content"],
-                    milvus_id=str(milvus_id),
-                    page_number=chunk_payload.get("page", chunk_payload.get("page_number")),
-                    chunk_index=chunk_index,
-                    image_ids=chunk_payload.get("image_ids", []),
-                ))
 
         await session.commit()
 
@@ -258,9 +263,8 @@ async def index_document_sync(
     doc_title: str = "",
     kb_id: str = "",
 ) -> list:
-    """parse-sync 的同步索引路径：向量索引 + milvus_id 回填 + （开关内）图谱构建。"""
+    """parse-sync 的同步索引路径：向量索引 + （开关内）图谱构建。"""
     milvus_ids = await indexer.index_document(document_id, chunks, doc_title=doc_title, kb_id=kb_id)
-    await update_chunk_milvus_ids(document_id, chunks, milvus_ids)
     await build_graph_after_index(document_id, chunks)
     return milvus_ids
 
@@ -280,9 +284,6 @@ async def do_parse(
         doc_title = (doc.original_name if doc else "") or ""
         kb_id = (doc.category_id if doc else None) or ""
 
-    # 注入系统级 VLM 配置（仅 vlm 模式会读取；其余模式注入亦无副作用）
-    strategy.vlm_config = await parse_config_service.resolve_vlm_for_strategy()
-
     # 1. 同步解析（在线程池中执行，避免阻塞事件循环）
     loop = asyncio.get_running_loop()
     parse_result = await loop.run_in_executor(None, parse_document, temp_path, doc_id, strategy)
@@ -300,8 +301,8 @@ async def do_parse(
     # 4. 分块
     chunks = split_pages_to_chunks(parse_result.pages, strategy, doc_id)
 
-    # 5. 保存业务元数据（chunk / image）到 PG（自包含 commit）
-    await save_parse_metadata(doc_id, chunks, uploaded_images, strategy)
+    # 5. 保存图片元数据到 PG（自包含 commit；分块内容只存 Milvus）
+    await save_parse_metadata(doc_id, uploaded_images)
 
     result = {
         "doc_id": doc_id,
@@ -349,16 +350,22 @@ async def run_parse_pipeline(document_id: str, *, enqueue_index: bool, strategy_
         user_id = doc.user_id
         oss_url = doc.oss_url
         filename = doc.filename
+        original_name = doc.original_name
+        mime_type = doc.mime_type
 
     temp_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as tmp:
+        suffix = resolve_temp_suffix(filename, original_name, mime_type)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             temp_path = tmp.name
 
         await download_file(oss_url, temp_path)
-        result = await do_parse(
-            document_id, temp_path, user_id,
-            enqueue_index=enqueue_index, strategy_override=strategy_override,
+        result = await asyncio.wait_for(
+            do_parse(
+                document_id, temp_path, user_id,
+                enqueue_index=enqueue_index, strategy_override=strategy_override,
+            ),
+            timeout=settings.PARSE_TIMEOUT_SECONDS,
         )
 
         async with AsyncSessionLocal() as session:
@@ -375,6 +382,14 @@ async def run_parse_pipeline(document_id: str, *, enqueue_index: bool, strategy_
             await session.commit()
 
         return result
+    except asyncio.TimeoutError:
+        async with AsyncSessionLocal() as session:
+            doc = await document_repo.get(session, document_id)
+            if doc:
+                doc.parse_status = "failed"
+                doc.parse_error = f"解析超时（>{settings.PARSE_TIMEOUT_SECONDS}s），已中止，请重新解析"
+                await session.commit()
+        raise
     except Exception as e:
         async with AsyncSessionLocal() as session:
             doc = await document_repo.get(session, document_id)

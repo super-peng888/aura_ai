@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from app.models.schemas import BaseResponse
 from app.db.base import AsyncSessionLocal
-from app.db.repository import conversation_repo, message_repo
+from app.db.repository import conversation_repo, image_repo, message_repo
 from app.db.models import User, Conversation, Message
 from app.api.auth import require_permission
 
@@ -97,6 +97,15 @@ async def get_conversation_messages(
 
         messages = await message_repo.list_by_conversation(session, conversation_id, limit=100)
 
+        # 批量解析助手消息引用的文档图片（image_ids → OSS URL），供前端回显
+        all_image_ids: set = set()
+        for m in messages:
+            all_image_ids.update(m.image_ids or [])
+        image_map = {}
+        if all_image_ids:
+            imgs = await image_repo.get_by_ref_ids(session, list(all_image_ids))
+            image_map = {img.image_ref_id: img for img in imgs}
+
     return BaseResponse(
         data=[
             {
@@ -104,6 +113,17 @@ async def get_conversation_messages(
                 "role": m.role,
                 "content": m.content,
                 "created_at": m.created_at,
+                "images": [
+                    {
+                        "image_id": iid,
+                        "url": image_map[iid].oss_url,
+                        "thumbnail_url": image_map[iid].thumbnail_url,
+                        "caption": image_map[iid].caption,
+                        "page_number": image_map[iid].page_number,
+                    }
+                    for iid in (m.image_ids or [])
+                    if iid in image_map
+                ],
             }
             for m in messages
         ]

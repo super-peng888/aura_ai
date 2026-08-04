@@ -23,7 +23,7 @@ settings = get_settings()
 _OVERRIDE_FIELDS = (
     "rerank_top_k", "similarity_threshold",
     "enable_query_rewrite", "enable_keyword_search", "enable_vector_search", "enable_rerank",
-    "rag_mode", "enable_graph_rag", "graph_search_mode",
+    "enable_graph_rag", "graph_search_mode",
 )
 
 
@@ -43,7 +43,6 @@ class RetrievalConfigService:
             "enable_keyword_search": settings.RAG_ENABLE_KEYWORD_SEARCH,
             "enable_vector_search": settings.RAG_ENABLE_VECTOR_SEARCH,
             "enable_rerank": settings.RAG_ENABLE_RERANK,
-            "rag_mode": "pipeline",  # RAG 模式默认走固定检索管道
             "enable_graph_rag": False,  # GraphRAG 图检索融合默认关闭（行为与旧版一致）
             "graph_search_mode": "auto",  # 图检索模式默认 local+global 并集
         }
@@ -93,7 +92,6 @@ class RetrievalConfigService:
             "enable_keyword_search": cfg["enable_keyword_search"],
             "enable_vector_search": cfg["enable_vector_search"],
             "enable_rerank": cfg["enable_rerank"],
-            "rag_mode": cfg["rag_mode"],
             "enable_graph_rag": cfg["enable_graph_rag"],
             "graph_search_mode": cfg["graph_search_mode"],
         }
@@ -109,7 +107,6 @@ class RetrievalConfigService:
                 enable_keyword_search=data["enable_keyword_search"],
                 enable_vector_search=data["enable_vector_search"],
                 enable_rerank=data["enable_rerank"],
-                rag_mode=data.get("rag_mode") or "pipeline",
                 enable_graph_rag=bool(data.get("enable_graph_rag", False)),
                 graph_search_mode=data.get("graph_search_mode") or "auto",
             )

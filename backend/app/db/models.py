@@ -13,7 +13,7 @@ from sqlalchemy import (
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 
 from app.db.base import Base
 
@@ -39,7 +39,7 @@ class User(Base):
     token_used_monthly: Mapped[int] = mapped_column(Integer, default=0)
     token_reset_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     default_strategy_id: Mapped[Optional[str]] = mapped_column(ForeignKey("parse_strategies.id"), nullable=True)
-    # 用户当前绑定的预设模型 provider: qwen / deepseek / glm / custom
+    # 用户当前绑定的对话模型：provider_models.id（36 位 uuid，系统或本人私有的 text/multi_modal 模型）；NULL 表示跟随系统默认对话模型
     default_model_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
@@ -76,7 +76,6 @@ class Document(Base):
     user: Mapped[Optional["User"]] = relationship(back_populates="documents")
     category: Mapped[Optional["Category"]] = relationship(back_populates="documents")
     strategy: Mapped[Optional["ParseStrategy"]] = relationship(back_populates="documents", lazy="selectin")
-    chunks: Mapped[List["DocumentChunk"]] = relationship(back_populates="document", lazy="selectin", cascade="all, delete-orphan")
     images: Mapped[List["DocumentImage"]] = relationship(back_populates="document", lazy="selectin", cascade="all, delete-orphan")
     parse_tasks: Mapped[List["ParseTask"]] = relationship(back_populates="document", lazy="selectin", cascade="all, delete-orphan")
     versions: Mapped[List["DocumentVersion"]] = relationship(back_populates="document", lazy="selectin", cascade="all, delete-orphan")
@@ -100,6 +99,8 @@ class ParseStrategy(Base):
     split_method: Mapped[str] = mapped_column(String(32), default="sentence")
     # 是否提取图片（仅 pymupdf_rich 模式下有效）
     extract_images: Mapped[bool] = mapped_column(default=False)
+    # vlm 模式的多模态模型引用：NULL/'system' = 系统通用模型，否则为 user_model_configs.id
+    vlm_model_ref: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
 
@@ -124,23 +125,6 @@ class Category(Base):
     parent: Mapped[Optional["Category"]] = relationship(remote_side="Category.id", back_populates="children")
     children: Mapped[List["Category"]] = relationship(back_populates="parent", lazy="selectin", cascade="all, delete-orphan")
     documents: Mapped[List["Document"]] = relationship(back_populates="category", lazy="selectin")
-
-
-class DocumentChunk(Base):
-    __tablename__ = "document_chunks"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    document_id: Mapped[str] = mapped_column(ForeignKey("documents.id"), nullable=False)
-    content: Mapped[str] = mapped_column(Text, nullable=False)
-    milvus_id: Mapped[str] = mapped_column(String(64), nullable=False)
-    page_number: Mapped[Optional[int]] = mapped_column(Integer)
-    chunk_index: Mapped[int] = mapped_column(Integer, default=0)
-    image_ids: Mapped[Optional[List[str]]] = mapped_column(JSONB, default=list)
-    chunk_metadata: Mapped[Optional[dict]] = mapped_column(JSONB, default=dict)
-    search_vector: Mapped[Optional[str]] = mapped_column(TSVECTOR)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
-
-    document: Mapped["Document"] = relationship(back_populates="chunks")
 
 
 class DocumentImage(Base):
@@ -375,6 +359,9 @@ class BIReport(Base):
 
 
 class UserModelConfig(Base):
+    """DEPRECATED：已迁移至 model_providers / provider_models（用户私有供应商），
+    代码面不再读写；表保留供 seed 历史迁移与回滚，后续手动清理。"""
+
     __tablename__ = "user_model_configs"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -387,6 +374,8 @@ class UserModelConfig(Base):
     top_p: Mapped[Optional[float]] = mapped_column(default=0.9)
     timeout: Mapped[Optional[int]] = mapped_column(Integer, default=60)
     is_current: Mapped[bool] = mapped_column(default=False)
+    # 多模态模型标记：可作为解析策略 vlm 模式的候选模型
+    is_multimodal: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
 
@@ -405,9 +394,91 @@ class SystemRetrievalConfig(Base):
     enable_keyword_search: Mapped[Optional[bool]] = mapped_column()
     enable_vector_search: Mapped[Optional[bool]] = mapped_column()
     enable_rerank: Mapped[Optional[bool]] = mapped_column()
-    rag_mode: Mapped[Optional[str]] = mapped_column(String(20))  # RAG 模式：pipeline / agentic（NULL=pipeline）
     enable_graph_rag: Mapped[Optional[bool]] = mapped_column()  # GraphRAG 图检索融合开关（NULL=关闭）
     graph_search_mode: Mapped[Optional[str]] = mapped_column(String(20))  # 图检索模式：auto / local / global（NULL=auto）
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
+
+
+class SystemModelSetting(Base):
+    """DEPRECATED：已迁移至 model_providers / provider_models + system_model_assignments，
+    代码面不再读写；表保留供 seed 历史迁移与回滚，后续手动清理。"""
+
+    __tablename__ = "system_model_settings"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    model_type: Mapped[str] = mapped_column(String(20), index=True, nullable=False)  # embedding | rerank | multi_modal | ordinary
+    model: Mapped[Optional[str]] = mapped_column(String(100))
+    base_url: Mapped[Optional[str]] = mapped_column(String(512))
+    api_key: Mapped[Optional[str]] = mapped_column(Text)  # Fernet 加密
+    dimension: Mapped[Optional[int]] = mapped_column(Integer)  # 仅 embedding
+    is_multimodal: Mapped[Optional[bool]] = mapped_column()  # 历史列
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
+
+
+class ModelProvider(Base):
+    """模型供应商（base_url + api_key 只配一次，下挂多个模型）。
+
+    owner_id = NULL → 系统供应商（admin 管理，登录可读）；
+    非 NULL → 用户私有供应商（替代原自定义模型）。
+    api_key Fernet 加密，NULL = 回落环境变量（DeepSeek 端点 → DEEPSEEK_API_KEY，
+    其余 → DASHSCOPE_API_KEY）。
+    """
+
+    __tablename__ = "model_providers"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    base_url: Mapped[str] = mapped_column(String(512), nullable=False)
+    api_key: Mapped[Optional[str]] = mapped_column(Text)  # Fernet 加密
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
+
+    models: Mapped[List["ProviderModel"]] = relationship(
+        back_populates="provider", lazy="selectin", cascade="all, delete-orphan",
+        order_by="ProviderModel.created_at",
+    )
+
+
+class ProviderModel(Base):
+    """供应商下的模型，能力标签单选：
+    chat（普通对话）/ multi_modal（多模态，可对话可 VLM 解析）/
+    embedding（带维度）/ rerank。对话参数字段仅私有模型使用，可为 NULL。"""
+
+    __tablename__ = "provider_models"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    provider_id: Mapped[str] = mapped_column(
+        ForeignKey("model_providers.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    model: Mapped[str] = mapped_column(String(100), nullable=False)
+    capability: Mapped[str] = mapped_column(String(20), nullable=False)  # text | multi_modal | embedding | rerank
+    dimension: Mapped[Optional[int]] = mapped_column(Integer)  # 仅 embedding
+    max_tokens: Mapped[Optional[int]] = mapped_column(Integer)
+    temperature: Mapped[Optional[float]] = mapped_column()
+    top_p: Mapped[Optional[float]] = mapped_column()
+    timeout: Mapped[Optional[int]] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
+
+    provider: Mapped["ModelProvider"] = relationship(back_populates="models", lazy="selectin")
+
+
+class SystemModelAssignment(Base):
+    """系统角色指派（admin 维护）：role → provider_models.id。
+
+    role ∈ embedding / rerank / vlm / chat；model_id 为 NULL（未指派/模型被删）
+    时运行时回落 config.py 环境变量默认。"""
+
+    __tablename__ = "system_model_assignments"
+
+    role: Mapped[str] = mapped_column(String(20), primary_key=True)
+    model_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("provider_models.id", ondelete="SET NULL"), nullable=True
+    )
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
 
 
@@ -426,6 +497,49 @@ class SystemParseConfig(Base):
     vlm_api_key: Mapped[Optional[str]] = mapped_column(Text)  # Fernet 加密
     vlm_detail_level: Mapped[Optional[str]] = mapped_column(String(10))  # high / low
     vlm_max_tokens: Mapped[Optional[int]] = mapped_column(Integer)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
+
+
+class ModelUsageLog(Base):
+    """模型调用用量埋点日志（按次记录，页面统计按天/按类型聚合）。
+
+    model_type 四类：embedding（向量模型）/ vlm（视觉解析模型）/
+    llm（通用对话模型）/ ocr（PaddleOCR，本地推理无 token，以调用次数计量）。
+    """
+
+    __tablename__ = "model_usage_logs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    model_type: Mapped[str] = mapped_column(String(20), nullable=False)  # embedding | vlm | llm | ocr
+    model_name: Mapped[str] = mapped_column(String(100), default="")
+    scene: Mapped[str] = mapped_column(String(50), default="")  # chat / rewrite / index / parse / graph …
+    user_id: Mapped[Optional[str]] = mapped_column(String(36))  # 无请求上下文（worker）时为 NULL
+    calls: Mapped[int] = mapped_column(Integer, default=1)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    extra: Mapped[Optional[dict]] = mapped_column(JSONB, default=dict)  # 如 {"image_count": 3}
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+
+
+class MCPServer(Base):
+    """MCP 外部工具服务器（admin 在配置中心维护）。
+
+    只对接 HTTP 形态的 MCP 服务器（streamable_http / sse），
+    智能体启动时从本表加载 enabled=True 的服务器并发现工具。
+    """
+
+    __tablename__ = "mcp_servers"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+    transport: Mapped[str] = mapped_column(String(32), default="streamable_http")
+    url: Mapped[str] = mapped_column(String(512), nullable=False)
+    # 额外请求头（如鉴权 token）：{"Authorization": "Bearer xxx"}
+    headers: Mapped[Optional[dict]] = mapped_column(JSONB, default=dict)
+    enabled: Mapped[bool] = mapped_column(default=True)
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
 
 

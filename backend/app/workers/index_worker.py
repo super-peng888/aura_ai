@@ -20,9 +20,10 @@ from app.services.index_queue import (
     ensure_consumer_group,
     read_index_tasks,
     ack_index_task,
+    claim_stale_tasks,
 )
 from app.services import indexer
-from app.services.document_parse_service import build_graph_after_index, update_chunk_milvus_ids
+from app.services.document_parse_service import build_graph_after_index
 from app.utils.cache import close_redis
 
 settings = get_settings()
@@ -81,7 +82,6 @@ async def _process_task(payload: dict) -> None:
             kb_id=kb_id,
         )
 
-        await update_chunk_milvus_ids(document_id, chunks, milvus_ids)
         async with AsyncSessionLocal() as session:
             await _update_document_status(session, document_id, "completed")
 
@@ -97,13 +97,59 @@ async def _process_task(payload: dict) -> None:
         raise
 
 
+async def _reset_stale_running_documents() -> int:
+    """看门狗：重置运行期遗留的 running 文档。
+
+    解析在 API 进程 BackgroundTasks 内执行，进程被杀/崩溃时在飞任务会止于
+    running（走不到 finally）。结合解析超时，running 正常应在 PARSE_TIMEOUT_SECONDS
+    内离开；超过阀值（再留一倍余量）仍为 running 则视为卡死，置 failed。
+    """
+    from sqlalchemy import update
+    from datetime import timedelta
+
+    threshold = settings.PARSE_TIMEOUT_SECONDS * 2
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=threshold)
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            update(Document)
+            .where(Document.parse_status == "running", Document.updated_at < cutoff)
+            .values(parse_status="failed", parse_error="解析超时或进程中断，请重新解析")
+        )
+        await session.commit()
+        count = result.rowcount or 0
+        if count:
+            logger.warning("Watchdog reset %s stale 'running' document(s) to 'failed'", count)
+        return count
+
+
 async def _consume_loop() -> None:
     await ensure_consumer_group()
     logger.info("Index worker started: consumer=%s", CONSUMER_NAME)
 
+    claim_idle_ms = settings.INDEX_WORKER_CLAIM_IDLE_MS
+    watchdog_interval = settings.PARSE_WATCHDOG_INTERVAL_SECONDS
+    loop = asyncio.get_running_loop()
+    last_watchdog = 0.0
+
     while True:
         try:
-            tasks = await read_index_tasks(CONSUMER_NAME, count=1, block_ms=5000)
+            # 看门狗：周期性重置运行期遗留的 running 文档（兜底“解析中”卡死）。
+            now = loop.time()
+            if now - last_watchdog >= watchdog_interval:
+                last_watchdog = now
+                try:
+                    await _reset_stale_running_documents()
+                except Exception as wd_err:
+                    logger.warning("Watchdog reset failed: %s", wd_err)
+
+            # 先接管崩溃/重启遗留的“在飞”任务（PEL 中长时间未 ack 的），兜底“索引中”卡死。
+            try:
+                stale = await claim_stale_tasks(CONSUMER_NAME, min_idle_ms=claim_idle_ms)
+            except Exception as claim_err:
+                logger.warning("Claim stale tasks failed: %s", claim_err)
+                stale = []
+
+            tasks = stale or await read_index_tasks(CONSUMER_NAME, count=1, block_ms=5000)
             if not tasks:
                 continue
 

@@ -242,7 +242,7 @@ services/document_parser.py::parse_document()
               └──► 同步 (parse-sync): document_parse_service.index_document_sync()
                         │
                         ├──► indexer.index_document()
-                        │         ├──► embedding_service.embed_dense() + embed_sparse()
+                        │         ├──► embedding_service.embed_dense()（qwen3-vl-embedding 多模态向量）
                         │         ├──► milvus_client.insert_chunks() ──► pymilvus 批量插入
                         │         │         （chunk metadata 含 doc_title / kb_id / heading_path / chunk_type）
                         │         └──► milvus_id 回填 PG document_chunks

@@ -1,33 +1,25 @@
-"""File storage upload and management service (OSS / MinIO / S3-compatible)."""
+"""File storage service for RustFS (local, S3-compatible via MinIO client)."""
 
+import logging
 import os
 import uuid
 import io
-from typing import Optional, BinaryIO
+import asyncio
 from datetime import datetime, timedelta
-import aiofiles
 
 from app.config import get_settings
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 
 class StorageService:
-    """Handle file uploads to OSS/MinIO and URL generation."""
+    """Handle file uploads to RustFS and URL generation (S3-compatible)."""
 
     def __init__(self):
-        self.provider = settings.OSS_PROVIDER
         self.bucket = settings.OSS_BUCKET
         self.public_url = settings.OSS_PUBLIC_URL or settings.OSS_ENDPOINT
 
-        if self.provider == "minio":
-            self._init_minio()
-        elif self.provider == "aliyun":
-            self._init_aliyun()
-        elif self.provider == "aws":
-            self._init_aws()
-
-    def _init_minio(self):
         from minio import Minio
 
         self.client = Minio(
@@ -36,33 +28,22 @@ class StorageService:
             secret_key=settings.OSS_SECRET_KEY,
             secure=settings.OSS_ENDPOINT.startswith("https"),
         )
-        # Ensure bucket exists
-        if not self.client.bucket_exists(self.bucket):
-            self.client.make_bucket(self.bucket)
-
-    def _init_aliyun(self):
-        import oss2
-
-        self.auth = oss2.Auth(settings.OSS_ACCESS_KEY, settings.OSS_SECRET_KEY)
-        self.client = oss2.Bucket(
-            self.auth, settings.OSS_ENDPOINT, self.bucket
-        )
-
-    def _init_aws(self):
-        import boto3
-
-        self.client = boto3.client(
-            "s3",
-            endpoint_url=settings.OSS_ENDPOINT,
-            aws_access_key_id=settings.OSS_ACCESS_KEY,
-            aws_secret_access_key=settings.OSS_SECRET_KEY,
-            region_name=settings.OSS_REGION,
-        )
+        # 确保 bucket 存在。凭据/网络错误时仅记警告，不阻断应用启动
+        # （否则存储不可用会连带 API、登录、聊天等全部无法启动）。
+        try:
+            if not self.client.bucket_exists(self.bucket):
+                self.client.make_bucket(self.bucket)
+        except Exception as e:
+            logger.warning(
+                "RustFS bucket 检查/创建失败：%s。应用仍会启动，但上传/下载会失败，"
+                "请核对 OSS_ENDPOINT / OSS_ACCESS_KEY / OSS_SECRET_KEY / OSS_BUCKET 配置。",
+                e,
+            )
 
     def _generate_object_key(
         self, document_id: str, filename: str, prefix: str = "files"
     ) -> str:
-        """Generate a unique object key for OSS."""
+        """Generate a unique object key for storage."""
         ext = os.path.splitext(filename)[1].lower()
         unique_id = uuid.uuid4().hex[:12]
         timestamp = datetime.now().strftime("%Y%m%d")
@@ -76,22 +57,10 @@ class StorageService:
         content_type: str = "application/octet-stream",
         prefix: str = "files",
     ) -> str:
-        """Upload file bytes to OSS and return the object key."""
+        """Upload file bytes to RustFS and return the object key."""
         object_key = self._generate_object_key(document_id, filename, prefix)
 
-        if self.provider == "minio":
-            await self._upload_minio(object_key, data, content_type)
-        elif self.provider == "aliyun":
-            await self._upload_aliyun(object_key, data, content_type)
-        elif self.provider == "aws":
-            await self._upload_aws(object_key, data, content_type)
-
-        return object_key
-
-    async def _upload_minio(self, object_key: str, data: bytes, content_type: str):
         # Run sync client in thread pool
-        import asyncio
-
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(
             None,
@@ -102,27 +71,7 @@ class StorageService:
             len(data),
             content_type,
         )
-
-    async def _upload_aliyun(self, object_key: str, data: bytes, content_type: str):
-        import asyncio
-
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None, self.client.put_object, object_key, io.BytesIO(data)
-        )
-
-    async def _upload_aws(self, object_key: str, data: bytes, content_type: str):
-        import asyncio
-
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None,
-            self.client.put_object,
-            Bucket=self.bucket,
-            Key=object_key,
-            Body=data,
-            ContentType=content_type,
-        )
+        return object_key
 
     def get_url(self, object_key: str, expires: int = 3600 * 24 * 7) -> str:
         """Get a presigned URL or public URL for an object."""
@@ -134,57 +83,28 @@ class StorageService:
             return f"{settings.OSS_PUBLIC_URL.rstrip('/')}/{object_key}"
 
         # Otherwise generate presigned URL
-        if self.provider == "minio":
-            from datetime import timedelta
-            url = self.client.presigned_get_object(self.bucket, object_key, timedelta(seconds=expires))
-            return url
-        elif self.provider == "aliyun":
-            url = self.client.sign_url("GET", object_key, expires)
-            return url
-        elif self.provider == "aws":
-            url = self.client.generate_presigned_url(
-                "get_object",
-                Params={"Bucket": self.bucket, "Key": object_key},
-                ExpiresIn=expires,
-            )
-            return url
+        return self.client.presigned_get_object(
+            self.bucket, object_key, timedelta(seconds=expires)
+        )
 
-        return f"{settings.OSS_ENDPOINT}/{self.bucket}/{object_key}"
-
-    async def get_presigned_upload_url(self, object_key: str, content_type: str, expires: int = 900) -> str:
+    async def get_presigned_upload_url(
+        self, object_key: str, content_type: str, expires: int = 900
+    ) -> str:
         """Get a presigned URL for uploading an object directly from client."""
-        if self.provider == "minio":
-            import asyncio
-            from datetime import timedelta
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(
-                None,
-                self.client.presigned_put_object,
-                self.bucket,
-                object_key,
-                timedelta(seconds=expires),
-            )
-        elif self.provider == "aliyun":
-            return self.client.sign_url("PUT", object_key, expires)
-        elif self.provider == "aws":
-            import asyncio
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(
-                None,
-                lambda: self.client.generate_presigned_url(
-                    "put_object",
-                    Params={"Bucket": self.bucket, "Key": object_key, "ContentType": content_type},
-                    ExpiresIn=expires,
-                ),
-            )
-        return ""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            self.client.presigned_put_object,
+            self.bucket,
+            object_key,
+            timedelta(seconds=expires),
+        )
 
     async def generate_thumbnail(
         self, image_data: bytes, max_size: int = 400
     ) -> bytes:
         """Generate a thumbnail from image bytes."""
         from PIL import Image
-        import asyncio
 
         loop = asyncio.get_event_loop()
 
@@ -201,7 +121,6 @@ class StorageService:
     async def get_image_info(self, image_data: bytes) -> dict:
         """Get image dimensions and format."""
         from PIL import Image
-        import asyncio
 
         loop = asyncio.get_event_loop()
 

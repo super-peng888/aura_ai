@@ -1,251 +1,217 @@
-"""Dense + sparse + multimodal embedding service.
+"""Multimodal embedding service（系统模型配置驱动，双路径）。
 
-配置全部来自 settings（app.config，系统级；修改后重启生效）：
-- 文本向量（dense）：EMBEDDING_TEXT_MODEL，OpenAI 兼容 embeddings 端点；
-  DASHSCOPE_API_KEY 缺失时 embed_dense 抛 RuntimeError（"不配不用"）。
-- 融合向量（dense+sparse）：EMBEDDING_FUSION_MODEL 配置时，embed_sparse 调用
-  该模型一次取回 sparse 向量；未配置时走内置 tokenizer 词频编码。
-  （注：阿里云 Maas compatible-api 的多模态/融合向量暂不支持 OpenAI 兼容接口，
-  这里按 OpenAI embeddings 响应 + 常见扩展字段做宽容解析，解析不到记 warning
-  回落本地 tokenizer。）
-- 多模态向量（图像）：EMBEDDING_MULTIMODAL_MODEL 配置时，embed_images 把图片
-  按 OpenAI 兼容多模态输入格式转向量；未配置抛 RuntimeError（调用方按需捕获）。
+模型配置经 system_model_service.resolve("embedding") 解析（DB 覆盖 settings 默认，
+api_key 回落 DASHSCOPE_API_KEY），按模型能力选择调用路径：
+- 多模态模型（qwen3-vl-embedding）：官方 dashscope SDK 的 MultiModalEmbedding.call()，
+  文本与图片编码到同一向量空间
+  - 独立向量：input 中每个输入（文本/图片）各返回 1 个向量
+    → embed_dense / embed_query（文本）、embed_images（图片）
+  - 融合向量（enable_fusion=True）：input 所有输入融合为 1 个向量
+    → embed_fused（图文统一表征，如图片+所属章节上下文）
+- 文本模型（text-embedding-v3 / qwen3.7-text-embedding 等 OpenAI 规范）：
+  POST {base_url}/embeddings，仅支持文本；embed_images 抛错、embed_fused 仅用文本，
+  图片向量能力由调用方（indexer）通过 supports_image() 预检降级。
+
+无本地模型、无兜底策略：API Key 缺失或请求失败直接抛错，由调用方决定降级。
 """
 
 import asyncio
 import base64
 import logging
+from http import HTTPStatus
 from typing import Union, List, Optional
-from collections import Counter
 
-from openai import AsyncOpenAI
+import dashscope
+from openai import AsyncOpenAI, RateLimitError
 
 from app.config import get_settings
+from app.services.usage_service import usage_service
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
-# Sparse 向量兜底实现：tokenizer 词频编码（BAAI/bge-m3 词表），不暴露为配置
-_SPARSE_PROVIDER = "tokenizer"
-_SPARSE_MODEL = "BAAI/bge-m3"
+EMBEDDING_NOT_CONFIGURED_MSG = "Embedding API Key 未配置（系统环境变量 DASHSCOPE_API_KEY 或模型配置页自定义 Key）"
+EMBEDDING_TEXT_ONLY_MSG = "当前向量模型仅支持文本，不支持图片向量化"
 
-# dense embedding 缺 API key 时的统一报错文案（模型名有默认值，通常只差 key）
-EMBEDDING_NOT_CONFIGURED_MSG = "Embedding API Key 未配置（系统环境变量 DASHSCOPE_API_KEY）"
-MULTIMODAL_NOT_CONFIGURED_MSG = "多模态向量化模型未配置（EMBEDDING_MULTIMODAL_MODEL），图像 embedding 不可用"
+# qwen3-vl-embedding 单次请求 input 总数 ≤ 20，其中图片 ≤ 10
+_TEXT_BATCH = 20
+_IMAGE_BATCH = 10
 
-# 融合响应中 sparse 向量的常见扩展字段（宽容解析，命中其一即可）
-_SPARSE_FIELD_CANDIDATES = ("sparse_embedding", "lexical_weights", "sparse")
-
-
-class SparseEmbeddingService:
-    """Lightweight sparse embedding using a tokenizer's vocabulary."""
-
-    def __init__(self):
-        self.model_name = _SPARSE_MODEL
-        self._tokenizer = None
-
-    def _load(self):
-        if self._tokenizer is None:
-            from transformers import AutoTokenizer
-            self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        return self._tokenizer
-
-    def _encode_single(self, text: str) -> dict:
-        tokenizer = self._load()
-        tokens = tokenizer(text, add_special_tokens=False)["input_ids"]
-        if not tokens:
-            return {}
-        counts = Counter(tokens)
-        total = len(tokens)
-        return {int(token_id): round(float(count) / total, 6) for token_id, count in counts.items()}
-
-    async def embed(self, texts: Union[str, List[str]]) -> List[dict]:
-        if isinstance(texts, str):
-            texts = [texts]
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, lambda: [self._encode_single(t) for t in texts])
-
-
-def _normalize_sparse(raw) -> Optional[dict]:
-    """把融合响应里的 sparse 扩展字段宽容归一为 {int_token_id: float_weight}。
-
-    支持 {str_id: weight} 字典与 [{"index": id, "value": w}] 列表两种常见形状；
-    归一失败返回 None（调用方回落本地 tokenizer）。
-    """
-    if isinstance(raw, dict):
-        try:
-            return {int(k): float(v) for k, v in raw.items()}
-        except (TypeError, ValueError):
-            return None
-    if isinstance(raw, list):
-        out = {}
-        try:
-            for item in raw:
-                if isinstance(item, dict):
-                    idx = item.get("index", item.get("token_id"))
-                    val = item.get("value", item.get("weight"))
-                elif isinstance(item, (list, tuple)) and len(item) == 2:
-                    idx, val = item
-                else:
-                    return None
-                out[int(idx)] = float(val)
-        except (TypeError, ValueError):
-            return None
-        return out
-    return None
-
-
-def _extract_sparse_from_response(resp) -> Optional[List[dict]]:
-    """从 OpenAI 兼容 embeddings 响应中宽容提取每条输入的 sparse 向量。
-
-    查找位置（按序）：data[i].sparse_embedding / lexical_weights / sparse
-    （对象属性或字典键）。任一字段缺失或形状不识别 → None（调用方回落）。
-    """
-    data = getattr(resp, "data", None)
-    if data is None and isinstance(resp, dict):
-        data = resp.get("data")
-    if not data:
-        return None
-    sparses: List[dict] = []
-    for item in data:
-        raw = None
-        for field in _SPARSE_FIELD_CANDIDATES:
-            if isinstance(item, dict):
-                raw = item.get(field)
-            else:
-                raw = getattr(item, field, None)
-            if raw:
-                break
-        sparse = _normalize_sparse(raw)
-        if sparse is None:
-            return None
-        sparses.append(sparse)
-    return sparses
+# 限流（HTTP 429 / Throttling）重试：批量索引后紧接着的 embed_query 极易撞限流，
+# 直接报错会导致对话链路检索 0 命中，指数退避重试后基本可自愈
+_THROTTLE_MAX_RETRIES = 3
+_THROTTLE_BASE_DELAY = 2.0  # 秒，退避序列 2s/4s/8s
 
 
 class EmbeddingService:
-    """OpenAI-compatible dense/sparse/multimodal embedding（settings 直读）。
-
-    AsyncOpenAI client 懒加载且按 settings 构建一次：配置变更 = 重启生效，
-    与"config.py 系统级"语义一致。
-    """
-
-    def __init__(self):
-        self._client: Optional[AsyncOpenAI] = None
-        self._sparse: Optional[SparseEmbeddingService] = (
-            SparseEmbeddingService() if _SPARSE_PROVIDER == "tokenizer" else None
-        )
-
-    def _get_client(self) -> AsyncOpenAI:
-        if self._client is None:
-            self._client = AsyncOpenAI(
-                api_key=settings.DASHSCOPE_API_KEY,
-                base_url=settings.MODEL_BASE_URL or None,
-            )
-        return self._client
-
-    def _require_api_key(self) -> None:
-        if not settings.DASHSCOPE_API_KEY:
-            raise RuntimeError(EMBEDDING_NOT_CONFIGURED_MSG)
-
-    async def embed_dense(self, texts: Union[str, List[str]]) -> List[List[float]]:
-        """文本向量（EMBEDDING_TEXT_MODEL）。行为与融合模型是否配置无关。"""
-        if isinstance(texts, str):
-            texts = [texts]
-        self._require_api_key()
-        return await self._embed_batch(self._get_client(), settings.EMBEDDING_TEXT_MODEL, texts)
+    """向量化客户端（system_model_service 解析配置，保存后运行时生效）。"""
 
     @staticmethod
-    async def _embed_batch(client: AsyncOpenAI, model: str, texts: List[str]) -> List[List[float]]:
-        batch_size = 128
-        all_embeddings = []
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
-            resp = await client.embeddings.create(model=model, input=batch, encoding_format="float")
-            sorted_data = sorted(resp.data, key=lambda x: x.index)
-            all_embeddings.extend([d.embedding for d in sorted_data])
-        return all_embeddings
+    async def _resolve() -> dict:
+        """解析生效 embedding 配置（model/base_url/api_key/dimension/is_multimodal）。"""
+        from app.services.system_model_service import system_model_service
 
-    async def embed_sparse(self, texts: Union[str, List[str]]) -> Optional[List[dict]]:
-        """Sparse 向量。
+        cfg = await system_model_service.resolve("embedding")
+        if not cfg.get("api_key"):
+            raise RuntimeError(EMBEDDING_NOT_CONFIGURED_MSG)
+        return cfg
 
-        配置了 EMBEDDING_FUSION_MODEL：调用融合模型，从响应扩展字段解析 sparse，
-        解析不到记 warning 回落本地 tokenizer；未配置：直接本地 tokenizer。
+    async def supports_image(self) -> bool:
+        """当前向量模型是否支持图片向量化（多模态）。"""
+        from app.services.system_model_service import system_model_service
+
+        cfg = await system_model_service.resolve("embedding")
+        return bool(cfg.get("is_multimodal"))
+
+    async def _post_contents(self, contents: List[dict], enable_fusion: bool = False) -> List[List[float]]:
+        """按生效配置分发到 dashscope 多模态路径或 OpenAI 文本路径。"""
+        cfg = await self._resolve()
+        if cfg["is_multimodal"]:
+            return await self._post_dashscope(cfg, contents, enable_fusion)
+        return await self._post_openai(cfg, contents)
+
+    async def _post_dashscope(
+        self, cfg: dict, contents: List[dict], enable_fusion: bool = False
+    ) -> List[List[float]]:
+        """调用 MultiModalEmbedding.call，按 index 排序返回向量列表（融合模式恒返回 1 个）。
+
+        SDK 为同步阻塞调用，用 asyncio.to_thread 包装避免阻塞事件循环。
         """
+        kwargs: dict = {
+            "api_key": cfg["api_key"],
+            "model": cfg["model"],
+            "input": contents,
+            "dimension": cfg["dimension"],
+        }
+        if enable_fusion:
+            kwargs["enable_fusion"] = True
+        resp = None
+        for attempt in range(_THROTTLE_MAX_RETRIES + 1):
+            resp = await asyncio.to_thread(dashscope.MultiModalEmbedding.call, **kwargs)
+            if resp.status_code == HTTPStatus.OK:
+                break
+            throttled = resp.status_code == HTTPStatus.TOO_MANY_REQUESTS or "Throttling" in str(resp.code or "")
+            if throttled and attempt < _THROTTLE_MAX_RETRIES:
+                delay = _THROTTLE_BASE_DELAY * (2 ** attempt)
+                logger.warning(
+                    "Embedding 限流（HTTP %s %s），%.0fs 后重试（%d/%d）",
+                    resp.status_code, resp.code, delay, attempt + 1, _THROTTLE_MAX_RETRIES,
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise RuntimeError(
+                f"Embedding 调用失败（HTTP {resp.status_code}）: {resp.code} {resp.message}"
+            )
+        embeddings = (resp.output or {}).get("embeddings") or []
+        if not embeddings:
+            raise RuntimeError(
+                f"Embedding 响应无向量数据: {resp.code} {resp.message}"
+            )
+        # 用量埋点（usage: input_tokens / image_tokens / total_tokens）
+        usage = getattr(resp, "usage", None) or {}
+        usage_service.track(
+            "embedding",
+            cfg["model"],
+            scene="fusion" if enable_fusion else "independent",
+            prompt_tokens=int(usage.get("input_tokens") or 0),
+            total_tokens=int(usage.get("total_tokens") or 0),
+            extra={"image_tokens": int(usage.get("image_tokens") or 0)},
+        )
+        sorted_items = sorted(embeddings, key=lambda x: x.get("index", 0))
+        return [item["embedding"] for item in sorted_items]
+
+    async def _post_openai(self, cfg: dict, contents: List[dict]) -> List[List[float]]:
+        """OpenAI 兼容文本路径：POST {base_url}/embeddings（仅文本输入）。"""
+        texts: List[str] = []
+        for item in contents:
+            if "image" in item:
+                raise RuntimeError(EMBEDDING_TEXT_ONLY_MSG)
+            texts.append(item["text"])
+        client = AsyncOpenAI(api_key=cfg["api_key"], base_url=cfg["base_url"], max_retries=0)
+        kwargs: dict = {"model": cfg["model"], "input": texts}
+        if cfg.get("dimension"):
+            kwargs["dimensions"] = cfg["dimension"]
+        resp = None
+        for attempt in range(_THROTTLE_MAX_RETRIES + 1):
+            try:
+                resp = await client.embeddings.create(**kwargs)
+                break
+            except RateLimitError:
+                if attempt >= _THROTTLE_MAX_RETRIES:
+                    raise
+                delay = _THROTTLE_BASE_DELAY * (2 ** attempt)
+                logger.warning(
+                    "Embedding 限流（HTTP 429），%.0fs 后重试（%d/%d）",
+                    delay, attempt + 1, _THROTTLE_MAX_RETRIES,
+                )
+                await asyncio.sleep(delay)
+        usage = getattr(resp, "usage", None)
+        usage_service.track(
+            "embedding",
+            cfg["model"],
+            scene="independent",
+            prompt_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
+            total_tokens=int(getattr(usage, "total_tokens", 0) or 0),
+        )
+        sorted_items = sorted(resp.data, key=lambda x: x.index)
+        return [item.embedding for item in sorted_items]
+
+    async def embed_dense(self, texts: Union[str, List[str]]) -> List[List[float]]:
+        """文本独立向量：每条文本 1 个向量，按批（≤20 条/请求）调用。"""
         if isinstance(texts, str):
             texts = [texts]
-        if settings.EMBEDDING_FUSION_MODEL:
-            sparses = await self._embed_sparse_fusion(texts)
-            if sparses is not None:
-                return sparses
-            logger.warning(
-                "Fusion embedding (%s) 响应未包含可解析的 sparse 向量，回落本地 tokenizer",
-                settings.EMBEDDING_FUSION_MODEL,
-            )
-        if self._sparse is None:
-            return None
-        return await self._sparse.embed(texts)
-
-    async def _embed_sparse_fusion(self, texts: List[str]) -> Optional[List[dict]]:
-        """调用融合模型并提取 sparse 向量；API 失败或解析失败返回 None。"""
-        try:
-            self._require_api_key()
-            client = self._get_client()
-            resp = await client.embeddings.create(
-                model=settings.EMBEDDING_FUSION_MODEL,
-                input=texts,
-                encoding_format="float",
-            )
-        except Exception as e:
-            logger.warning("Fusion embedding request failed: %s", e)
-            return None
-        return _extract_sparse_from_response(resp)
+        all_embeddings: List[List[float]] = []
+        for i in range(0, len(texts), _TEXT_BATCH):
+            batch = texts[i : i + _TEXT_BATCH]
+            all_embeddings.extend(await self._post_contents([{"text": t} for t in batch]))
+        return all_embeddings
 
     async def embed_query(self, query: str) -> List[float]:
         embeddings = await self.embed_dense(query)
         return embeddings[0]
 
-    async def embed_query_sparse(self, query: str) -> Optional[dict]:
-        result = await self.embed_sparse(query)
-        return result[0] if result else None
-
     async def embed_images(self, images: List[Union[bytes, str]]) -> List[List[float]]:
-        """多模态图像向量（EMBEDDING_MULTIMODAL_MODEL）。
+        """图片独立向量：每张图 1 个向量，按批（≤10 张/请求）调用。
 
-        images 元素：bytes（图片二进制，转 base64 data URL）或 str
-        （data URL / http(s) URL，原样透传）。按 OpenAI 兼容多模态输入格式
-        （input 为 content parts 列表）POST {MODEL_BASE_URL}/embeddings——
-        走裸 httpx 而非 SDK（SDK 对 input 的类型校验不含 content parts 形状）。
-        响应按 OpenAI embeddings 形状宽容解析；未配置模型抛 RuntimeError。
+        images 元素：bytes（图片二进制，转 base64 Data URI）或 str
+        （data URI / 公开可访问的 http(s) URL，原样透传）。
+        仅多模态向量模型支持；文本模型抛 RuntimeError，由调用方预检降级。
         """
-        if not settings.EMBEDDING_MULTIMODAL_MODEL:
-            raise RuntimeError(MULTIMODAL_NOT_CONFIGURED_MSG)
-        self._require_api_key()
-        import httpx
-
-        inputs = [
-            [{"type": "image_url", "image_url": {"url": self._to_image_url(img)}}]
-            for img in images
-        ]
-        url = f"{settings.MODEL_BASE_URL.rstrip('/')}/embeddings"
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                url,
-                headers={"Authorization": f"Bearer {settings.DASHSCOPE_API_KEY}"},
-                json={
-                    "model": settings.EMBEDDING_MULTIMODAL_MODEL,
-                    "input": inputs,
-                    "encoding_format": "float",
-                },
+        all_embeddings: List[List[float]] = []
+        for i in range(0, len(images), _IMAGE_BATCH):
+            batch = images[i : i + _IMAGE_BATCH]
+            all_embeddings.extend(
+                await self._post_contents([{"image": self._to_image_url(img)} for img in batch])
             )
-            resp.raise_for_status()
-            data = (resp.json() or {}).get("data") or []
-        sorted_data = sorted(data, key=lambda x: x.get("index", 0))
-        return [d["embedding"] for d in sorted_data]
+        return all_embeddings
+
+    async def embed_fused(
+        self,
+        text: Optional[str] = None,
+        images: Optional[List[Union[bytes, str]]] = None,
+    ) -> List[float]:
+        """融合向量（enable_fusion=True）：文本+图片融合为 1 个向量。
+
+        适用于整体表征图文内容的场景（如图片+所属章节上下文入库）。
+        text 与 images 至少提供其一；文本向量模型下仅用文本（无文本则抛错）。
+        """
+        if not await self.supports_image():
+            if not text:
+                raise RuntimeError(EMBEDDING_TEXT_ONLY_MSG)
+            images = None
+        contents: List[dict] = []
+        if text:
+            contents.append({"text": text})
+        for img in images or []:
+            contents.append({"image": self._to_image_url(img)})
+        if not contents:
+            raise ValueError("embed_fused 需要至少一个文本或图片输入")
+        vectors = await self._post_contents(contents, enable_fusion=True)
+        return vectors[0]
 
     @staticmethod
     def _to_image_url(image: Union[bytes, str]) -> str:
-        """bytes → base64 data URL；str（data:/http(s): URL）原样透传。"""
+        """bytes → base64 Data URI；str（data:/http(s): URL）原样透传。"""
         if isinstance(image, bytes):
             b64 = base64.b64encode(image).decode("ascii")
             return f"data:image/png;base64,{b64}"

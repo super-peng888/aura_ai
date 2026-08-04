@@ -27,7 +27,7 @@ from app.models.schemas import (
 )
 from sqlalchemy import func
 from app.db.base import AsyncSessionLocal
-from app.db.repository import document_repo, chunk_repo, document_version_repo, image_repo
+from app.db.repository import document_repo, document_version_repo, image_repo
 from app.db.models import User, DocumentVersion
 from app.api.auth import require_permission, get_current_user
 from app.services.document_parser import parse_document as parse_document_file
@@ -36,10 +36,10 @@ from app.services.document_parse_service import (
     DocumentNotFoundError,
     download_file,
     resolve_strategy,
+    resolve_temp_suffix,
     run_parse_pipeline,
     trigger_parse_background,
 )
-from app.services.parse_config_service import parse_config_service
 from app.services import indexer
 from app.core.knowledge.rag_pipeline import rag_pipeline
 
@@ -171,39 +171,12 @@ async def get_document_status(document_id: str):
     )
 
 
-@router.get("/{document_id}/chunks")
-async def list_document_chunks(document_id: str):
-    """获取文档的分块列表（已持久化到数据库的）。"""
-    async with AsyncSessionLocal() as session:
-        doc = await document_repo.get(session, document_id)
-        if not doc:
-            raise HTTPException(status_code=404, detail="Document not found")
-
-        chunks = await chunk_repo.list(session, limit=1000)
-        doc_chunks = [c for c in chunks if str(c.document_id) == document_id]
-
-    return BaseResponse(
-        data=[
-            {
-                "id": str(c.id),
-                "chunk_index": c.chunk_index,
-                "page_number": c.page_number,
-                "content": c.content,
-                "image_ids": c.image_ids or [],
-                "milvus_id": c.milvus_id,
-                "created_at": c.created_at,
-            }
-            for c in doc_chunks
-        ]
-    )
-
-
 @router.post("/{document_id}/chunks/preview")
 async def preview_chunks(document_id: str, request: ChunkPreviewRequest):
     """预览分块结果（不写入数据库/Milvus，仅返回分块数据）。
 
     策略解析与正式解析一致：显式 strategy_id > document.strategy_id > 用户默认 > 系统默认，
-    内联参数在基底策略上覆盖；VLM 模式注入系统级 VLM 配置。
+    内联参数在基底策略上覆盖；VLM 模式的模型配置为系统级（settings）。
     """
     async with AsyncSessionLocal() as session:
         doc = await document_repo.get(session, document_id)
@@ -212,12 +185,13 @@ async def preview_chunks(document_id: str, request: ChunkPreviewRequest):
         strategy = await resolve_strategy(session, doc.user_id, doc, request)
         oss_url = doc.oss_url
         filename = doc.filename
-
-    strategy.vlm_config = await parse_config_service.resolve_vlm_for_strategy()
+        original_name = doc.original_name
+        mime_type = doc.mime_type
 
     temp_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as tmp:
+        suffix = resolve_temp_suffix(filename, original_name, mime_type)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             temp_path = tmp.name
 
         await download_file(oss_url, temp_path)
@@ -308,6 +282,7 @@ async def delete_document(document_id: str, current_user: User = Depends(require
         doc = await document_repo.get(session, document_id)
         if doc:
             await document_repo.delete(session, doc)
+            await session.commit()
     return BaseResponse(data={"message": "Document deleted"})
 
 
