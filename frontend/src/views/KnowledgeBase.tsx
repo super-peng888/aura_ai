@@ -64,7 +64,7 @@ const typeColors: Record<string, { bg: string; text: string }> = {
   default: { bg: "bg-surface-100", text: "text-[#57534e]" },
 }
 
-type DocStatus = "pending" | "running" | "completed" | "failed"
+type DocStatus = "pending" | "running" | "indexing" | "completed" | "failed"
 
 interface DocumentItem {
   id: string
@@ -116,6 +116,11 @@ const statusConfig: Record<DocStatus, { label: string; style: string; icon: Reac
   running: {
     label: "解析中",
     style: "bg-amber-50 text-amber-600 border-amber-100",
+    icon: Loader2,
+  },
+  indexing: {
+    label: "索引中",
+    style: "bg-sky-50 text-sky-600 border-sky-100",
     icon: Loader2,
   },
   pending: {
@@ -208,8 +213,6 @@ export default function KnowledgeBase() {
   const [pcSplitMethod, setPcSplitMethod] = useState("")
   const [pcExtractImages, setPcExtractImages] = useState("")
   const [isParseStarting, setIsParseStarting] = useState(false)
-  // 抽屉内文档图片映射（image_ref_id / id -> oss_url）
-  const [drawerImageMap, setDrawerImageMap] = useState<Record<string, string>>({})
   // 检索测试
   const [showSearchTest, setShowSearchTest] = useState(false)
   const [searchTestQuery, setSearchTestQuery] = useState("")
@@ -224,15 +227,13 @@ export default function KnowledgeBase() {
   // 详情抽屉
   const [showDetailDrawer, setShowDetailDrawer] = useState(false)
   const [drawerDocId, setDrawerDocId] = useState<string | null>(null)
-  const [drawerTab, setDrawerTab] = useState<"overview" | "chunks" | "versions">("overview")
+  const [drawerTab, setDrawerTab] = useState<"overview" | "versions">("overview")
   const [drawerLoading, setDrawerLoading] = useState(false)
   const [drawerDoc, setDrawerDoc] = useState<any>(null)
-  const [drawerChunks, setDrawerChunks] = useState<any[]>([])
   const [drawerVersions, setDrawerVersions] = useState<any[]>([])
   // 拖拽上传
   const [isDragging, setIsDragging] = useState(false)
   const dragCounter = useRef(0)
-  const drawerDocIdRef = useRef<string | null>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const location = useLocation()
 
@@ -256,11 +257,6 @@ export default function KnowledgeBase() {
       .then((res) => setParseStrategies(res || []))
       .catch(() => {})
   }, [])
-
-  // 同步抽屉文档 id 到 ref（供解析轮询回调读取最新值）
-  useEffect(() => {
-    drawerDocIdRef.current = drawerDocId
-  }, [drawerDocId])
 
   // 加载文档列表
   useEffect(() => {
@@ -451,9 +447,7 @@ export default function KnowledgeBase() {
         const status = res.parse_status
         if (status === "completed") {
           toast.success("文档解析完成")
-          // 完成后刷新文档列表与抽屉分块，形成"解析后回显分块"闭环
           loadDocuments()
-          if (drawerDocIdRef.current === documentId) loadDrawerChunks(documentId)
           break
         } else if (status === "failed") {
           toast.error("文档解析失败: " + (res.parse_error || "未知错误"))
@@ -548,20 +542,9 @@ export default function KnowledgeBase() {
     setDrawerDoc(doc || null)
     // 并行加载所有数据
     await Promise.all([
-      loadDrawerChunks(docId),
       loadDrawerVersions(docId),
-      loadDrawerImages(docId),
     ])
     setDrawerLoading(false)
-  }
-
-  const loadDrawerChunks = async (docId: string) => {
-    try {
-      const res = await api.get<any[]>(`/documents/${docId}/chunks`)
-      setDrawerChunks(res || [])
-    } catch {
-      setDrawerChunks([])
-    }
   }
 
   const loadDrawerVersions = async (docId: string) => {
@@ -570,21 +553,6 @@ export default function KnowledgeBase() {
       setDrawerVersions(res || [])
     } catch {
       setDrawerVersions([])
-    }
-  }
-
-  // 加载文档图片，建立 image_id -> oss_url 映射供分块缩略图回显
-  const loadDrawerImages = async (docId: string) => {
-    try {
-      const res = await api.get<any[]>(`/documents/${docId}/images`)
-      const map: Record<string, string> = {}
-      for (const img of res || []) {
-        if (img.image_ref_id) map[img.image_ref_id] = img.oss_url
-        if (img.id) map[img.id] = img.oss_url
-      }
-      setDrawerImageMap(map)
-    } catch {
-      setDrawerImageMap({})
     }
   }
 
@@ -662,7 +630,7 @@ export default function KnowledgeBase() {
   const stats = useMemo(() => [
     { label: "全部文档", value: documents.length, icon: FileText, color: "text-blue-600", bg: "bg-blue-50" },
     { label: "已索引", value: documents.filter((d) => d.parse_status === "completed").length, icon: CheckCircle, color: "text-emerald-600", bg: "bg-emerald-50" },
-    { label: "解析中", value: documents.filter((d) => d.parse_status === "pending" || d.parse_status === "running").length, icon: Clock, color: "text-amber-600", bg: "bg-amber-50" },
+    { label: "解析中", value: documents.filter((d) => d.parse_status === "pending" || d.parse_status === "running" || d.parse_status === "indexing").length, icon: Clock, color: "text-amber-600", bg: "bg-amber-50" },
     { label: "向量片段", value: "8.4k", icon: Grid3X3, color: "text-purple-600", bg: "bg-purple-50" },
   ], [documents])
 
@@ -879,7 +847,7 @@ export default function KnowledgeBase() {
             const type = doc.type || getFileType(doc.original_name)
             const colors = typeColors[type] || typeColors.default
             const Icon = typeIcons[type] || typeIcons.default
-            const status = statusConfig[doc.parse_status]
+            const status = statusConfig[doc.parse_status] || statusConfig.pending
             const StatusIcon = status.icon
             const isSelected = selectedIds.has(doc.id)
 
@@ -911,14 +879,14 @@ export default function KnowledgeBase() {
                     <Icon className={cn("size-6", colors.text)} />
                   </div>
                   <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                    {doc.parse_status === "pending" && (
+                    {(doc.parse_status === "pending" || doc.parse_status === "failed") && (
                       <button
                         onClick={(e) => {
                           e.stopPropagation()
                           openParseConfig(doc.id)
                         }}
                         className="w-7 h-7 rounded-lg flex items-center justify-center text-emerald-600 hover:bg-emerald-50 transition-all"
-                        title="解析配置"
+                        title={doc.parse_status === "failed" ? "重新解析" : "解析配置"}
                       >
                         <Zap className="size-3.5" />
                       </button>
@@ -956,7 +924,7 @@ export default function KnowledgeBase() {
                 <div className="flex items-center justify-between">
                   <div className="flex gap-1.5 flex-wrap">
                     <span className={cn("px-2 py-0.5 rounded-md text-[10px] font-medium border flex items-center gap-1", status.style)}>
-                      <StatusIcon className={cn("size-3", doc.parse_status === "running" && "animate-spin")} />
+                      <StatusIcon className={cn("size-3", (doc.parse_status === "running" || doc.parse_status === "indexing") && "animate-spin")} />
                       {status.label}
                     </span>
                     <span className="px-2 py-0.5 rounded-md bg-[#f5f5f4] text-[#57534e] text-[10px] font-medium border border-[#e7e5e4]">
@@ -1001,7 +969,7 @@ export default function KnowledgeBase() {
             const type = doc.type || getFileType(doc.original_name)
             const colors = typeColors[type] || typeColors.default
             const Icon = typeIcons[type] || typeIcons.default
-            const status = statusConfig[doc.parse_status]
+            const status = statusConfig[doc.parse_status] || statusConfig.pending
             const StatusIcon = status.icon
             const isSelected = selectedIds.has(doc.id)
 
@@ -1037,7 +1005,7 @@ export default function KnowledgeBase() {
                 <div className="text-xs text-[#78716c]">{formatFileSize(doc.file_size)}</div>
                 <div>
                   <span className={cn("px-2 py-0.5 rounded-md text-[10px] font-medium border flex items-center gap-1 w-fit", status.style)}>
-                    <StatusIcon className={cn("size-3", doc.parse_status === "running" && "animate-spin")} />
+                    <StatusIcon className={cn("size-3", (doc.parse_status === "running" || doc.parse_status === "indexing") && "animate-spin")} />
                     {status.label}
                   </span>
                 </div>
@@ -1555,7 +1523,6 @@ export default function KnowledgeBase() {
             <div className="flex items-center gap-0 px-5 border-b border-[#e7e5e4] bg-[#fafaf9]">
               {([
                 { key: "overview", label: "概览", icon: Info },
-                { key: "chunks", label: "分块", icon: Layers },
                 { key: "versions", label: "版本", icon: History },
               ] as const).map((t) => (
                 <button
@@ -1684,45 +1651,6 @@ export default function KnowledgeBase() {
                       删除
                     </Button>
                   </div>
-                </div>
-              ) : drawerTab === "chunks" ? (
-                <div className="space-y-3">
-                  {drawerChunks.length === 0 ? (
-                    <div className="text-center py-12 text-sm text-[#a8a29e]">暂无分块数据</div>
-                  ) : (
-                    drawerChunks.map((chunk: any, idx: number) => (
-                      <div key={chunk.id || idx} className="p-3 rounded-xl bg-[#fafaf9] border border-[#e7e5e4]">
-                        <div className="flex items-center flex-wrap gap-2 mb-1.5">
-                          <span className="text-[10px] font-bold text-primary bg-primary/10 px-1.5 py-0.5 rounded">#{idx + 1}</span>
-                          <span className="text-[10px] text-[#a8a29e]">第 {chunk.page_number ?? chunk.page ?? "-"} 页</span>
-                          {chunk.image_ids?.length > 0 && (
-                            <span className="text-[10px] text-purple-600 bg-purple-50 px-1.5 py-0.5 rounded border border-purple-100">
-                              {chunk.image_ids.length} 张图片
-                            </span>
-                          )}
-                        </div>
-                        <p className="text-xs text-[#44403c] leading-relaxed whitespace-pre-wrap line-clamp-6">{stripImgPlaceholders(chunk.content)}</p>
-                        {chunk.image_ids?.length > 0 && (
-                          <div className="flex flex-wrap gap-2 mt-2">
-                            {chunk.image_ids.map((imgId: string) => {
-                              const url = drawerImageMap[imgId]
-                              if (!url) return null
-                              return (
-                                <a key={imgId} href={url} target="_blank" rel="noreferrer">
-                                  <img
-                                    src={url}
-                                    alt="分块图片"
-                                    loading="lazy"
-                                    className="h-16 w-auto rounded-lg border border-[#e7e5e4] object-cover hover:opacity-80 transition-opacity"
-                                  />
-                                </a>
-                              )
-                            })}
-                          </div>
-                        )}
-                      </div>
-                    ))
-                  )}
                 </div>
               ) : (
                 <div className="space-y-2">

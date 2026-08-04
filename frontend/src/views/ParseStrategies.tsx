@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react"
+import { Select } from "antd"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -35,16 +36,36 @@ interface ParseStrategy {
   split_method: string
   extract_images: boolean
   is_default: boolean
+  vlm_model_ref: string | null
   created_at: string
   updated_at: string
+}
+
+// 系统供应商下的多模态模型（/model-providers/ 中 scope=system 且 capability=multi_modal 的候选）
+interface ProviderModelInfo {
+  id: string
+  model: string
+  capability: string
+}
+
+interface Provider {
+  id: string
+  name: string
+  scope: "system" | "mine"
+  models: ProviderModelInfo[]
+}
+
+interface VlmModelOption {
+  value: string // "system"（自动使用系统多模态模型）或 provider_models.id
+  label: string
 }
 
 // 解析模式收敛为三种：pymupdf / paddleocr / vlm
 // （txt/md/json/csv 等纯文本文件由后端按扩展名自动走纯文本解析，无需选择）
 const modeOptions = [
-  { value: "pymupdf", label: "PyMuPDF 图文提取", icon: FileText, desc: "PDF 文本 + 图片提取，支持图文并茂引用" },
+  { value: "pymupdf", label: "PyMuPDF 快速解析", icon: FileText, desc: "PDF 文本 + 图片提取，速度快、零模型成本" },
   { value: "paddleocr", label: "PaddleOCR", icon: ScanText, desc: "扫描件 / 图片型文档文字 OCR 识别" },
-  { value: "vlm", label: "VLM 视觉理解", icon: BrainCircuit, desc: "图表 / 架构图 / 手写文档，使用 qwen3-vl-flash" },
+  { value: "vlm", label: "VLM 多模态解析", icon: BrainCircuit, desc: "多模态模型逐页转写为结构化 Markdown，标题 / 表格 / 图表语义完整" },
 ]
 
 // 历史模式值仅做展示兼容（存量策略可能仍是旧值，后端会自动归一）
@@ -68,6 +89,7 @@ export default function ParseStrategies() {
   const [isLoading, setIsLoading] = useState(true)
   const [showDialog, setShowDialog] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
+  const [vlmOptions, setVlmOptions] = useState<VlmModelOption[]>([])
 
   const [form, setForm] = useState({
     name: "",
@@ -77,6 +99,7 @@ export default function ParseStrategies() {
     dimension: 1536,
     split_method: "sentence",
     extract_images: false,
+    vlm_model_ref: "system",
   })
 
   const loadStrategies = async () => {
@@ -91,8 +114,31 @@ export default function ParseStrategies() {
     }
   }
 
+  // 加载 VLM 多模态模型候选："system" 自动使用系统多模态模型 + 系统供应商下的 multi_modal 模型
+  const loadVlmOptions = async () => {
+    const options: VlmModelOption[] = [{ value: "system", label: "系统默认（自动选择系统多模态模型）" }]
+    try {
+      const res = await api.get<{ providers: Provider[] }>("/model-providers/")
+      for (const p of res?.providers || []) {
+        if (p.scope !== "system") continue
+        for (const m of p.models) {
+          if (m.capability === "multi_modal") {
+            options.push({
+              value: m.id,
+              label: `${p.name} / ${m.model}`,
+            })
+          }
+        }
+      }
+    } catch {
+      // error toast by api client
+    }
+    setVlmOptions(options)
+  }
+
   useEffect(() => {
     loadStrategies()
+    loadVlmOptions()
   }, [])
 
   const openCreate = () => {
@@ -105,6 +151,7 @@ export default function ParseStrategies() {
       dimension: 1536,
       split_method: "sentence",
       extract_images: false,
+      vlm_model_ref: "system",
     })
     setShowDialog(true)
   }
@@ -119,6 +166,7 @@ export default function ParseStrategies() {
       dimension: s.dimension,
       split_method: s.split_method,
       extract_images: s.extract_images,
+      vlm_model_ref: s.vlm_model_ref || "system",
     })
     setShowDialog(true)
   }
@@ -167,9 +215,14 @@ export default function ParseStrategies() {
   const modeLabel = (mode: string) =>
     modeOptions.find((m) => m.value === mode)?.label || legacyModeLabels[mode] || mode
   const splitLabel = (method: string) => splitOptions.find((s) => s.value === method)?.label || method
+  // vlm 策略卡片展示所选多模态模型名（ref 失效时回落显示系统默认）
+  const vlmRefLabel = (ref: string | null) => {
+    const value = ref || "system"
+    return vlmOptions.find((o) => o.value === value)?.label || "系统默认（自动选择系统多模态模型）"
+  }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 pb-10">
       <PageHeader />
 
       {/* ===================== 解析策略 Section ===================== */}
@@ -259,6 +312,11 @@ export default function ParseStrategies() {
                       提取图片
                     </span>
                   )}
+                  {s.parse_mode === "vlm" && (
+                    <span className="px-1.5 py-0.5 rounded bg-blue-50 text-blue-600 border border-blue-100">
+                      {vlmRefLabel(s.vlm_model_ref)}
+                    </span>
+                  )}
                 </div>
 
                 <div className="flex items-center gap-2">
@@ -341,6 +399,29 @@ export default function ParseStrategies() {
               </p>
             </div>
 
+            {form.parse_mode === "vlm" && (
+              <div>
+                <label className="text-sm font-medium text-[#44403c] mb-1.5 block">多模态模型</label>
+                {vlmOptions.length > 1 ? (
+                  <Select
+                    className="w-full"
+                    value={form.vlm_model_ref}
+                    onChange={(v) => setForm((f) => ({ ...f, vlm_model_ref: v }))}
+                    options={[
+                      ...vlmOptions.map((o) => ({ value: o.value, label: o.label })),
+                      ...(vlmOptions.some((o) => o.value === form.vlm_model_ref)
+                        ? []
+                        : [{ value: form.vlm_model_ref, label: "已失效的模型引用（将回落系统默认）" }]),
+                    ]}
+                  />
+                ) : (
+                  <p className="text-xs text-amber-600 bg-amber-50 border border-amber-100 rounded-lg px-2.5 py-1.5">
+                    系统暂无可用的多模态模型，请先到「模型配置」页在系统供应商下添加多模态能力的模型
+                  </p>
+                )}
+              </div>
+            )}
+
             <div className="grid grid-cols-3 gap-3">
               <div>
                 <label className="text-[10px] text-[#a8a29e] mb-1 block">Chunk Size</label>
@@ -383,15 +464,12 @@ export default function ParseStrategies() {
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <label className="text-sm font-medium text-[#44403c] mb-1.5 block">切分方式</label>
-                <select
-                  className="w-full px-3 py-2 rounded-xl bg-white border border-[#e7e5e4] text-sm text-[#44403c] outline-none focus:border-primary focus:ring-4 focus:ring-primary/10 transition-all appearance-none"
+                <Select
+                  className="w-full"
                   value={form.split_method}
-                  onChange={(e) => setForm((f) => ({ ...f, split_method: e.target.value }))}
-                >
-                  {splitOptions.map((s) => (
-                    <option key={s.value} value={s.value}>{s.label}</option>
-                  ))}
-                </select>
+                  onChange={(v) => setForm((f) => ({ ...f, split_method: v }))}
+                  options={splitOptions.map((s) => ({ value: s.value, label: s.label }))}
+                />
               </div>
               <div className="flex items-end">
                 <label className="flex items-center gap-2 text-sm text-[#44403c] cursor-pointer pb-2">

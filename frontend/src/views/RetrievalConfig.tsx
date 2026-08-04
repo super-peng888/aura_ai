@@ -7,25 +7,20 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import PageHeader from "@/components/layout/PageHeader"
-import { useAuth } from "@/context/AuthContext"
 import {
   AlertCircle,
-  Bot,
-  BrainCircuit,
   Globe,
   Loader2,
   MapPin,
   Route,
   Save,
   Search,
-  Workflow,
 } from "lucide-react"
 
 // ============================================================================
 // Types (与后端 /retrieval-config/ 契约一致)
 // ============================================================================
 
-type RagMode = "pipeline" | "agentic"
 type GraphSearchMode = "auto" | "local" | "global"
 
 interface RetrievalConfig {
@@ -34,35 +29,9 @@ interface RetrievalConfig {
   enable_keyword_search: boolean
   enable_vector_search: boolean
   enable_rerank: boolean
-  rag_mode: RagMode
   enable_graph_rag: boolean
   graph_search_mode: GraphSearchMode
 }
-
-// 系统级解析配置（/parse-config/，仅 admin 可读写）
-interface ParseConfig {
-  vlm_model: string
-  vlm_base_url: string
-  vlm_api_key_masked: string
-  vlm_api_key_configured: boolean
-  vlm_detail_level: "high" | "low"
-  vlm_max_tokens: number
-}
-
-const ragModeOptions: {
-  value: RagMode
-  label: string
-  desc: string
-  icon: React.ComponentType<{ className?: string }>
-}[] = [
-  { value: "pipeline", label: "固定流水线", desc: "按固定流水线执行检索与重排，延迟稳定可控", icon: Workflow },
-  {
-    value: "agentic",
-    label: "智能体自主检索",
-    desc: "大模型自主决定何时检索、检索几次，并自我修正，更灵活但延迟更高",
-    icon: Bot,
-  },
-]
 
 const graphSearchModeOptions: {
   value: GraphSearchMode
@@ -120,14 +89,8 @@ const inputClass =
 export default function RetrievalConfig() {
   const [isLoading, setIsLoading] = useState(true)
   const [isSaving, setIsSaving] = useState(false)
-  // 仅含检索策略字段；reranker / embedding 模型为服务端系统级配置，不在页面可配
+  // 仅含检索策略字段；reranker / embedding / VLM 模型为服务端系统级配置，不在页面可配
   const [config, setConfig] = useState<RetrievalConfig | null>(null)
-  // VLM 视觉解析模型（系统级配置，仅 admin 可见可编辑）
-  const { user } = useAuth()
-  const isAdmin = user?.role === "admin"
-  const [parseConfig, setParseConfig] = useState<ParseConfig | null>(null)
-  const [vlmApiKey, setVlmApiKey] = useState("")
-  const [isSavingVlm, setIsSavingVlm] = useState(false)
 
   const loadConfig = async () => {
     setIsLoading(true)
@@ -137,7 +100,6 @@ export default function RetrievalConfig() {
         // 后端并行开发中，新字段可能暂未下发，给默认值兜底
         setConfig({
           ...res,
-          rag_mode: res.rag_mode ?? "pipeline",
           enable_graph_rag: res.enable_graph_rag ?? false,
           graph_search_mode: res.graph_search_mode ?? "auto",
         })
@@ -149,51 +111,13 @@ export default function RetrievalConfig() {
     }
   }
 
-  // 加载 VLM 解析配置（仅 admin；非 admin 403 时静默忽略，区块不渲染）
-  const loadParseConfig = async () => {
-    try {
-      const res = await api.get<ParseConfig>("/parse-config/")
-      if (res) setParseConfig(res)
-    } catch {
-      // 忽略，区块不渲染
-    }
-  }
-
   useEffect(() => {
     loadConfig()
-    if (isAdmin) loadParseConfig()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const update = <K extends keyof RetrievalConfig>(key: K, value: RetrievalConfig[K]) => {
     setConfig((prev) => (prev ? { ...prev, [key]: value } : prev))
-  }
-
-  const updateVlm = <K extends keyof ParseConfig>(key: K, value: ParseConfig[K]) => {
-    setParseConfig((prev) => (prev ? { ...prev, [key]: value } : prev))
-  }
-
-  const handleSaveVlm = async () => {
-    if (!parseConfig) return
-    setIsSavingVlm(true)
-    try {
-      const body: Record<string, any> = {
-        vlm_model: parseConfig.vlm_model,
-        vlm_base_url: parseConfig.vlm_base_url,
-        vlm_detail_level: parseConfig.vlm_detail_level,
-        vlm_max_tokens: parseConfig.vlm_max_tokens,
-      }
-      // api_key 留空表示保持不变
-      if (vlmApiKey.trim()) body.vlm_api_key = vlmApiKey.trim()
-      const res = await api.put<ParseConfig>("/parse-config/", body)
-      if (res) setParseConfig(res)
-      setVlmApiKey("")
-      toast.success("VLM 解析配置已保存")
-    } catch {
-      // 错误已在 api client 中 toast
-    } finally {
-      setIsSavingVlm(false)
-    }
   }
 
   const handleSave = async () => {
@@ -256,50 +180,13 @@ export default function RetrievalConfig() {
           </div>
         </div>
         <div className="p-6 space-y-5">
-          {/* 检索模式 */}
-          <div>
-            <Label className="text-xs font-medium text-[#78716c] mb-1.5 block">检索模式</Label>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              {ragModeOptions.map((opt) => (
-                <button
-                  key={opt.value}
-                  onClick={() => update("rag_mode", opt.value)}
-                  className={cn(
-                    "flex items-start gap-2 p-3 rounded-xl border text-left transition-all",
-                    config.rag_mode === opt.value
-                      ? "border-primary bg-primary/5 ring-1 ring-primary/20"
-                      : "border-[#e7e5e4] hover:border-primary/30"
-                  )}
-                >
-                  <opt.icon
-                    className={cn(
-                      "size-4 mt-0.5 flex-shrink-0",
-                      config.rag_mode === opt.value ? "text-primary" : "text-[#a8a29e]"
-                    )}
-                  />
-                  <div>
-                    <p
-                      className={cn(
-                        "text-xs font-medium",
-                        config.rag_mode === opt.value ? "text-primary" : "text-[#44403c]"
-                      )}
-                    >
-                      {opt.label}
-                    </p>
-                    <p className="text-[10px] text-[#a8a29e] mt-0.5">{opt.desc}</p>
-                  </div>
-                </button>
-              ))}
-            </div>
-          </div>
-
           <div className="grid grid-cols-1 md:grid-cols-2 gap-x-5 gap-y-4">
             {(
               [
                 { key: "enable_vector_search", label: "向量检索", desc: "基于向量相似度召回文档分片" },
                 { key: "enable_keyword_search", label: "关键词检索", desc: "基于关键词匹配召回文档分片" },
                 { key: "enable_query_rewrite", label: "查询改写", desc: "改写用户查询以提升召回效果" },
-                { key: "enable_rerank", label: "Rerank 重排序", desc: "对召回结果重新排序提升精度（重排序模型由系统管理员在服务端配置）" },
+                { key: "enable_rerank", label: "Rerank 重排序", desc: "对召回结果重新排序提升精度（排序模型由系统管理员在服务端配置）" },
                 {
                   key: "enable_graph_rag",
                   label: "GraphRAG 知识图谱",
@@ -382,94 +269,6 @@ export default function RetrievalConfig() {
           </div>
         </div>
       </section>
-
-      {/* ===================== VLM 视觉解析模型（系统级，仅 admin） ===================== */}
-      {parseConfig && (
-        <section className="bg-white rounded-2xl border border-[#e7e5e4] shadow-[0_1px_3px_rgba(0,0,0,0.04)] overflow-hidden">
-          <div className="px-6 py-4 border-b border-[#f5f5f4] flex items-center gap-3">
-            <div className="w-8 h-8 rounded-lg bg-purple-50 text-purple-600 flex items-center justify-center">
-              <BrainCircuit className="size-4" />
-            </div>
-            <div>
-              <h3 className="text-sm font-semibold text-[#292524]">VLM 视觉解析模型</h3>
-              <p className="text-xs text-[#a8a29e]">图表 / 架构图 / 手写等视觉密集文档的解析（默认 qwen3-vl-flash）</p>
-            </div>
-          </div>
-          <div className="p-6 space-y-5">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-x-5 gap-y-4">
-              <FormGroup label="模型" hint="经济实惠推荐 qwen3-vl-flash">
-                <Input
-                  value={parseConfig.vlm_model}
-                  onChange={(e) => updateVlm("vlm_model", e.target.value)}
-                  placeholder="qwen3-vl-flash"
-                  className={inputClass}
-                />
-              </FormGroup>
-              <FormGroup label="Base URL" hint="OpenAI 兼容接口地址">
-                <Input
-                  value={parseConfig.vlm_base_url}
-                  onChange={(e) => updateVlm("vlm_base_url", e.target.value)}
-                  placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1"
-                  className={inputClass}
-                />
-              </FormGroup>
-              <FormGroup
-                label="API Key"
-                hint={
-                  parseConfig.vlm_api_key_configured
-                    ? `当前已配置（${parseConfig.vlm_api_key_masked}），留空保持不变`
-                    : "尚未配置，VLM 解析模式不可用，请配置后使用"
-                }
-              >
-                <Input
-                  type="password"
-                  value={vlmApiKey}
-                  onChange={(e) => setVlmApiKey(e.target.value)}
-                  placeholder={parseConfig.vlm_api_key_configured ? parseConfig.vlm_api_key_masked : "sk-..."}
-                  className={inputClass}
-                />
-              </FormGroup>
-              <div className="grid grid-cols-2 gap-x-5">
-                <FormGroup label="Detail Level" hint="high 更精细，low 更省 tokens">
-                  <select
-                    value={parseConfig.vlm_detail_level}
-                    onChange={(e) => updateVlm("vlm_detail_level", e.target.value as "high" | "low")}
-                    className={cn(inputClass, "w-full appearance-none")}
-                  >
-                    <option value="high">high</option>
-                    <option value="low">low</option>
-                  </select>
-                </FormGroup>
-                <FormGroup label="Max Tokens" hint="256 - 32768">
-                  <Input
-                    type="number"
-                    min={256}
-                    max={32768}
-                    step={256}
-                    value={parseConfig.vlm_max_tokens}
-                    onChange={(e) => updateVlm("vlm_max_tokens", Number(e.target.value))}
-                    className={inputClass}
-                  />
-                </FormGroup>
-              </div>
-            </div>
-            <div className="flex justify-end">
-              <Button
-                onClick={handleSaveVlm}
-                disabled={isSavingVlm}
-                className="btn-primary-gradient rounded-xl px-5"
-              >
-                {isSavingVlm ? (
-                  <span className="inline-block size-4 border-2 border-white/30 border-t-white rounded-full animate-spin mr-2" />
-                ) : (
-                  <Save className="size-4 mr-2" />
-                )}
-                保存 VLM 配置
-              </Button>
-            </div>
-          </div>
-        </section>
-      )}
 
       {/* 保存 */}
       <div className="flex justify-end mb-8">

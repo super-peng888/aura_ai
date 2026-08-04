@@ -13,8 +13,10 @@ import PromptMarket from "@/views/PromptMarket"
 import ParseStrategies from "@/views/ParseStrategies"
 import ModelConfig from "@/views/ModelConfig"
 import RetrievalConfig from "@/views/RetrievalConfig"
+import MCPConfig from "@/views/MCPConfig"
 import MenuManage from "@/views/MenuManage"
 import DataAnalysis from "@/views/DataAnalysis"
+import ModelUsage from "@/views/ModelUsage"
 import Login from "@/views/Login"
 
 /**
@@ -57,7 +59,9 @@ const router = createBrowserRouter([
       { path: "model-config", element: <ModelConfig /> },
       { path: "config-center", element: <Navigate to="/model-config" replace /> },
       { path: "retrieval-config", element: <RetrievalConfig /> },
+      { path: "mcp-config", element: <MCPConfig /> },
       { path: "data-analysis", element: <DataAnalysis /> },
+      { path: "model-usage", element: <ModelUsage /> },
       { path: "*", element: <Navigate to="/" replace /> },
     ],
   },

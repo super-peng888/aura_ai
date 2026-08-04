@@ -23,6 +23,7 @@ import {
   ChevronDown,
   SlidersHorizontal,
   Bot,
+  Plug,
   type LucideIcon,
 } from "lucide-react"
 
@@ -44,6 +45,7 @@ const iconMap: Record<string, LucideIcon> = {
   ChevronDown,
   SlidersHorizontal,
   Bot,
+  Plug,
 }
 
 function getIcon(name?: string | null): LucideIcon {

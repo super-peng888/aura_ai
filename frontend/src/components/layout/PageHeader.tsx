@@ -21,6 +21,7 @@ const pathMap: Record<string, { label: string; parent?: string }> = {
   "/model-config": { label: "模型配置", parent: "/config-center" },
   "/parse-strategies": { label: "解析策略", parent: "/config-center" },
   "/retrieval-config": { label: "检索配置", parent: "/config-center" },
+  "/mcp-config": { label: "MCP 工具", parent: "/config-center" },
 }
 
 export default function PageHeader({ className }: { className?: string }) {
